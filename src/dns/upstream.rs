@@ -1488,6 +1488,51 @@ impl FakeIpStore {
                                     inner.inet6_current = Some(ipv6_next(ipv6_next(start)));
                                 }
                             }
+                            // ── 加载持久化的分配指针（参照 sing-box metadata.Inet4Current/Inet6Current）
+                            //
+                            // 上面通过 max(record)+1 重建的指针在「写指针尚未刷盘但记录已写」的
+                            // race 场景下可能落后于真实分配位置，导致重启后误用已分配的 IP。
+                            // 取 max(重建值, 持久化值) 作为权威指针：
+                            //   - 正常场景：持久化值 == 重建值（每条 record 写入时同步刷指针）
+                            //   - 崩溃场景：持久化值 < 重建值（指针未刷但 record 已写）→ 取重建值
+                            //   - 旧 cache 文件：持久化值缺失 → 仅用重建值（向后兼容）
+                            //   - TTL 清理后重启：持久化值 > 重建值（部分 record 被清理）→ 取持久化值
+                            //     （跳过被清理的 IP，避免立即重用可能仍驻留客户端 DNS 缓存的地址）
+                            if let Some((pv4, pv6)) = cr.load_fakeip_pointers() {
+                                if let Some(pv4) = pv4 {
+                                    // 仅当持久化指针落在 range 内才采纳，防止旧 range 残留污染。
+                                    let in_range = inet4_net
+                                        .is_some_and(|(s, e)| pv4 >= s && pv4 <= e);
+                                    if in_range {
+                                        inner.inet4_current = Some(match inner.inet4_current {
+                                            Some(cur) => {
+                                                if u32::from(pv4) > u32::from(cur) {
+                                                    pv4
+                                                } else {
+                                                    cur
+                                                }
+                                            }
+                                            None => pv4,
+                                        });
+                                    }
+                                }
+                                if let Some(pv6) = pv6 {
+                                    let in_range = inet6_net
+                                        .is_some_and(|(s, e)| pv6 >= s && pv6 <= e);
+                                    if in_range {
+                                        inner.inet6_current = Some(match inner.inet6_current {
+                                            Some(cur) => {
+                                                if u128::from(pv6) > u128::from(cur) {
+                                                    pv6
+                                                } else {
+                                                    cur
+                                                }
+                                            }
+                                            None => pv6,
+                                        });
+                                    }
+                                }
+                            }
                             tracing::info!(count, "restored fakeip mappings from cache");
                             // 首次启动时（无 range tag 记录）写入当前 range，
                             // 供下次启动做变化检测。
@@ -1692,6 +1737,9 @@ impl FakeIpStore {
         inner.domain_to_v4.insert(domain.to_string(), next);
         if let Some(ref cf) = self.cache_file {
             cf.store_fakeip_entry(std::net::IpAddr::V4(next), domain);
+            // 持久化分配指针（参照 sing-box FakeIPSaveMetadataAsync）。
+            // 异步串行写入，不阻塞查询路径。
+            cf.store_fakeip_pointers(Some(next), inner.inet6_current);
         }
         Some(next)
     }
@@ -1735,6 +1783,8 @@ impl FakeIpStore {
         inner.domain_to_v6.insert(domain.to_string(), next);
         if let Some(ref cf) = self.cache_file {
             cf.store_fakeip_entry(std::net::IpAddr::V6(next), domain);
+            // 持久化分配指针（参照 sing-box FakeIPSaveMetadataAsync）。
+            cf.store_fakeip_pointers(inner.inet4_current, Some(next));
         }
         Some(next)
     }
@@ -2028,5 +2078,106 @@ mod tests {
     fn fakeip_cidr_parse_v6() {
         let (start, _) = parse_ipv6_cidr("fc00::/18").unwrap();
         assert_eq!(start, "fc00::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    /// 验证 fakeip 分配指针持久化与重启恢复：
+    /// 1) 第一次启动：分配若干 IP，指针前移
+    /// 2) 重启：从持久化恢复，指针应不回退（≥ 重建值），避免重复分配已分配的 IP
+    ///
+    /// 参照 sing-box `Store.Start()` 从 metadata 恢复 `inet4Current/inet6Current`。
+    #[tokio::test]
+    async fn fakeip_pointer_persistence_across_restart() {
+        use crate::experimental::cache_file::open_cache_file;
+        use tempfile::NamedTempFile;
+
+        let f = NamedTempFile::new().unwrap();
+        let cfg = FakeIpConfig {
+            inet4_range: Some("198.18.0.0/15".into()),
+            inet6_range: None,
+            exclude_domain: vec![],
+            exclude_domain_suffix: vec![],
+        };
+
+        // 第一次启动：分配 5 个不同域名的 IP
+        let (cf1, rd1) = open_cache_file(f.path(), true, 7, false, 3600).unwrap();
+        let store1 = FakeIpStore::new_with_cache(&cfg, Some(cf1.clone()), Some(rd1.clone()))
+            .unwrap();
+        for i in 0..5 {
+            let q = make_fakeip_query(&format!("host{i}.example.com"), 1);
+            let _ = store1.reply(&q).unwrap();
+        }
+        // 等待异步写入刷盘
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 取最后一次分配的 IP（指针位置）
+        let last_q = make_fakeip_query("last.example.com", 1);
+        let last_resp = store1.reply(&last_q).unwrap();
+        let last_ip_bytes: [u8; 4] = last_resp[last_resp.len() - 4..].try_into().unwrap();
+        let last_ip = Ipv4Addr::from(last_ip_bytes);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 重启：重新打开同一个 cache_file
+        // 注意：必须 drop 旧句柄，redb 不允许多个写句柄同时打开同一文件
+        drop(store1);
+        drop(cf1);
+        drop(rd1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (cf2, rd2) = open_cache_file(f.path(), true, 7, false, 3600).unwrap();
+        let store2 = FakeIpStore::new_with_cache(&cfg, Some(cf2), Some(rd2)).unwrap();
+
+        // 重启后下一次分配的 IP 必须 > last_ip（指针未回退）
+        let next_q = make_fakeip_query("next.example.com", 1);
+        let next_resp = store2.reply(&next_q).unwrap();
+        let next_ip_bytes: [u8; 4] = next_resp[next_resp.len() - 4..].try_into().unwrap();
+        let next_ip = Ipv4Addr::from(next_ip_bytes);
+        assert!(
+            u32::from(next_ip) > u32::from(last_ip),
+            "pointer regressed after restart: last={last_ip}, next={next_ip}"
+        );
+    }
+
+    /// 验证 range 变化时持久化指针被清除（防止旧 range 的指针污染新 range）。
+    /// 参照 sing-box `Store.Start()`：metadata.Inet4Range != s.inet4Range 时
+    /// 调用 `FakeIPReset()` 清空持久化数据。
+    #[tokio::test]
+    async fn fakeip_range_change_clears_pointers() {
+        use crate::experimental::cache_file::open_cache_file;
+        use tempfile::NamedTempFile;
+
+        let f = NamedTempFile::new().unwrap();
+        let cfg1 = FakeIpConfig {
+            inet4_range: Some("198.18.0.0/15".into()),
+            inet6_range: None,
+            exclude_domain: vec![],
+            exclude_domain_suffix: vec![],
+        };
+
+        // 第一次启动：分配 IP，持久化指针
+        let (cf1, rd1) = open_cache_file(f.path(), true, 7, false, 3600).unwrap();
+        let store1 = FakeIpStore::new_with_cache(&cfg1, Some(cf1.clone()), Some(rd1.clone()))
+            .unwrap();
+        let _ = store1.reply(&make_fakeip_query("a.example.com", 1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(store1);
+        drop(cf1);
+        drop(rd1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 第二次启动：换 range（从 /15 改成 /16）
+        let cfg2 = FakeIpConfig {
+            inet4_range: Some("198.18.0.0/16".into()),
+            inet6_range: None,
+            exclude_domain: vec![],
+            exclude_domain_suffix: vec![],
+        };
+        let (cf2, rd2) = open_cache_file(f.path(), true, 7, false, 3600).unwrap();
+        let store2 = FakeIpStore::new_with_cache(&cfg2, Some(cf2), Some(rd2)).unwrap();
+
+        // 新 range 下，第一次分配的 IP 应从 start+2 = 198.18.0.2 开始
+        let resp = store2.reply(&make_fakeip_query("b.example.com", 1)).unwrap();
+        let ip_bytes: [u8; 4] = resp[resp.len() - 4..].try_into().unwrap();
+        let ip = Ipv4Addr::from(ip_bytes);
+        assert_eq!(ip, Ipv4Addr::new(198, 18, 0, 2));
     }
 }
