@@ -216,8 +216,10 @@ pub struct RouteRuleConfig {
     pub sniff_timeout_ms: u64,
 
     /// 指定启用的嗅探协议列表，如 `["tls", "http", "quic", "ssh", "bittorrent"]`。
-    /// 省略或为空时使用默认列表（tls/http/quic/ssh/bittorrent）。
-    /// 支持的值：`"tls"`, `"http"`, `"quic"`, `"ssh"`, `"bittorrent"`（或 `"bt"`）。
+    /// 省略或为空时使用默认列表 `["tls", "http", "quic"]`（覆盖日常上网场景）。
+    /// 需要其他协议（如 WebRTC 视频通话、SSH、BT）时按需显式配置。
+    /// 支持的值：`"tls"`, `"http"`, `"quic"`, `"ssh"`, `"bittorrent"`（或 `"bt"`），
+    /// `"dns"`, `"dtls"`, `"stun"`, `"ntp"`, `"rdp"`。
     #[serde(default)]
     pub sniff_type: Vec<String>,
 
