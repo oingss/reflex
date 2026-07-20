@@ -65,20 +65,20 @@ impl SniffType {
         }
     }
 
-    /// 默认启用的协议列表（对齐 sing-box 常用协议）
+    /// 默认启用的协议列表：仅 TLS / HTTP / QUIC 三种，覆盖日常上网场景
+    /// （HTTPS 站点、HTTP 站点、HTTP/3 流量）。
+    ///
+    /// 设计动机：sing-box 默认列出了 6 种 TCP + QUIC 嗅探器，reflex 之前更激进
+    /// 地默认启用 10 种。但对绝大多数上网流量而言，多余协议只会带来无谓开销
+    /// （每个新连接都要尝试匹配）。SSH/BT/DNS/DTLS/STUN/NTP/RDP 等场景化
+    /// 协议交给用户按需配置 `sniff_type` 字段。
+    ///
+    /// 如需启用其他协议，例如要做 WebRTC 视频通话分流：
+    /// ```json
+    /// { "sniff": true, "sniff_type": ["tls", "http", "quic", "stun", "dtls"] }
+    /// ```
     pub fn defaults() -> Vec<Self> {
-        vec![
-            Self::Tls,
-            Self::Http,
-            Self::Quic,
-            Self::Ssh,
-            Self::BitTorrent,
-            Self::Dns,
-            Self::Dtls,
-            Self::Stun,
-            Self::Ntp,
-            Self::Rdp,
-        ]
+        vec![Self::Tls, Self::Http, Self::Quic]
     }
 }
 
