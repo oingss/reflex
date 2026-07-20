@@ -1,0 +1,121 @@
+name: Gnu
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.0.0)"
+        required: true
+        default: 'v0.1.0'
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check version format
+        id: check
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]; then
+            echo "::error::Invalid version format: '$VERSION'. Expected vX.Y.Z or vX.Y.Z-suffix"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version OK: $VERSION"
+
+  build:
+    name: Build / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:   x86_64-unknown-linux-gnu
+            artifact: reflex-linux-x86_64-gnu
+            cross:    false
+          - target:   aarch64-unknown-linux-gnu
+            artifact: reflex-linux-aarch64-gnu
+            cross:    true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install cross (aarch64)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build reflex (native)
+        if: matrix.cross == false
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --bin reflex \
+            --features outbound-net
+
+      - name: Build reflex (cross)
+        if: matrix.cross == true
+        run: |
+          cross build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --bin reflex \
+            --features outbound-net
+
+      - name: Collect binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/reflex" dist/reflex
+          cd dist
+          tar -czf "../${{ matrix.artifact }}.tar.gz" reflex
+          cd ..
+          sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          echo "=== Build output ==="
+          ls -lh "${{ matrix.artifact }}.tar.gz"
+          cat    "${{ matrix.artifact }}.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   gnu-test
+          name:       "reflex gnu-test"
+          prerelease: ${{ github.event.inputs.prerelease }}
+          draft:      false
+          files: |
+            *.tar.gz

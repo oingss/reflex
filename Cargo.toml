@@ -1,0 +1,134 @@
+[package]
+name = "reflex"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "reflex"
+path = "src/main.rs"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+outbound-net = [
+    "dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs",
+    "dep:rustls-pemfile", "dep:tokio-tungstenite", "dep:quinn",
+    "dep:hyper-rustls",
+    # VMess: AES-128-GCM / ChaCha20-Poly1305 分帧加密 + KDF
+    "dep:aes", "dep:aes-gcm", "dep:chacha20poly1305",
+    "dep:hmac", "dep:sha2", "dep:sha3", "dep:md-5",
+    "dep:crc32fast", "dep:fnv",
+    # REALITY
+    "dep:x25519-dalek", "dep:hkdf", "dep:hex", "dep:rand",
+    # Shadowsocks
+    "dep:sha1", "dep:blake3",
+    # WireGuard (Noise handshake, Blake2s)
+    "dep:blake2",
+    # ShadowQuic（基于 quinn-jls 的 0-RTT QUIC + JLS SNI 伪装）
+    "dep:shadowquic",
+    # Pin quinn-jls / quinn-proto-jls 到 0.3.4 / 0.3.5：
+    # shadowquic 0.3.11（2026-06-10 发布）编写时基于这两个版本，
+    # 但 quinn-*-jls 0.3.6（2026-06-11 发布）更改了 congestion::Controller
+    # trait 的 on_congestion_event 签名（5→6 参数），导致 shadowquic 0.3.11
+    # 无法编译。此处将传递依赖锁定到兼容版本。
+    "dep:quinn-jls", "dep:quinn-proto-jls",
+    # gRPC 传输：prost 用于 protobuf varint 编解码（h2 已是默认依赖）
+    "dep:prost",
+    # SSH 出站：russh + dirs + totp-rs
+    "dep:russh", "dep:dirs", "dep:totp-rs",
+    # Tailscale 出站
+    "dep:tailscale",
+]
+
+[dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+serde_yaml       = "0.9"
+thiserror        = "1"
+anyhow           = "1"
+tokio            = { version = "1", features = ["full"] }
+bytes            = "1"
+socket2          = { version = "0.5", features = ["all"] }
+libc             = "0.2"
+dashmap          = "5"
+lru              = "0.12"
+tracing          = "0.1"
+async-trait      = "0.1"
+futures-util     = "0.3"
+tokio-stream     = "0.1"
+uuid             = { version = "1", features = ["v4"] }
+pin-project-lite = "0.2"
+redb             = "2"
+ureq             = "2"
+reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream", "http2"] }
+flate2           = "1"
+base64           = "0.22"
+h2               = "0.4"
+hyper            = { version = "1", features = ["http1", "http2", "client"] }
+hyper-util       = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
+hyper-rustls     = { version = "0.27", default-features = false, features = ["http2", "ring", "rustls-native-certs"], optional = true }
+http-body-util   = "0.1"
+tower            = { version = "0.5", features = ["util"] }
+http             = "1"
+regex            = "1"
+ahash            = "0.8"
+fst              = "0.4"
+tun              = { version = "0.8", features = ["async"] }
+# RuleSet 文件热更新：notify 提供 inotify/FSEvents/ReadDirectoryChangesW 抽象
+notify           = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# outbound-net optional deps
+tokio-rustls        = { version = "0.26", optional = true }
+rustls              = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pemfile      = { version = "2", optional = true }
+tokio-tungstenite   = { version = "0.24", features = ["rustls-tls-native-roots"], optional = true }
+quinn               = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+# ShadowQuic 出站：内部使用 quinn-jls（JLS SNI 伪装的 quinn 分支），与 reflex 自带的 quinn 0.11 互不冲突
+shadowquic          = { version = "0.3.7", default-features = false, features = ["shadowquic-quinn", "ring"], optional = true }
+# 版本锁定（见上方 outbound-net feature 注释）：阻止 cargo 把传递依赖
+# 升级到不兼容的 quinn-*-jls 0.3.6。仅在 outbound-net 启用时拉入。
+quinn-jls           = { version = "=0.3.4", default-features = false, optional = true }
+quinn-proto-jls     = { version = "=0.3.5", default-features = false, optional = true }
+# VMess 加密（AES-GCM 握手 + ChaCha20-Poly1305 数据层）
+aes              = { version = "0.8",  optional = true }
+aes-gcm          = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+hmac             = { version = "0.12", optional = true }
+sha2             = { version = "0.10", optional = true }
+sha3             = { version = "0.10", optional = true }
+md-5             = { version = "0.10", optional = true }
+sha1             = { version = "0.10", optional = true }
+blake3           = { version = "1",    optional = true }
+blake2           = { version = "0.10", optional = true }
+# VMess AuthID CRC32 + FNV header checksum
+crc32fast        = { version = "1", optional = true }
+fnv              = { version = "1", optional = true }
+# REALITY 依赖
+x25519-dalek     = { version = "2", features = ["static_secrets"], optional = true }
+hkdf             = { version = "0.12", optional = true }
+hex              = { version = "0.4", optional = true }
+rand             = { version = "0.8", optional = true }
+# gRPC 传输：prost 用于 protobuf varint 编解码（h2 在上方已作为非可选依赖引入）
+prost            = { version = "0.13", optional = true }
+# SSH 出站：russh 客户端（async-trait + rsa 算法），dirs 解析 ~/.ssh，totp-rs 提供 2FA
+russh            = { version = "0.51", default-features = false, features = ["async-trait"], optional = true }
+dirs             = { version = "5", optional = true }
+totp-rs          = { version = "5", features = ["serde_support"], optional = true }
+# Tailscale 出站：tailscale-rs userspace netstack
+tailscale        = { version = "0.3", optional = true }
+
+[lib]
+name = "reflex"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "=3.13.0"
+tokio    = { version = "1", features = ["full"] }
+
+[profile.release]
+strip         = "symbols"  # 剥离调试符号表，不影响运行
+debug         = false      # 不内嵌调试信息
+lto           = true       # fat LTO：完整跨 crate 内联分析，比 "thin" 多榨 3-8% 吞吐
+codegen-units = 1          # 单编译单元，允许更完整的内联分析
+panic         = "abort"    # panic 直接退出，去掉 unwind 运行时；proxy 场景无影响
