@@ -308,21 +308,20 @@ impl DnsResolver {
     /// 同步更新所有 fakeip upstream 的 strategy。
     /// 在 global.ipv6=false 时调用，强制覆盖为 Ipv4Only。
     pub fn set_fakeip_strategy(&self, s: crate::config::dns::ResolveStrategy) {
+        // default 即 upstreams 中的一个（按 config.r#final 取出），迭代覆盖即可；
+        // 且 from_config_full 已校验 default 不能是 fakeip，无需重复检查。
         for upstream in self.upstreams.values() {
             if let upstream::UpstreamKind::FakeIp { store } = &upstream.kind {
                 store.set_strategy(s);
             }
         }
-        // default upstream 也可能是 fakeip
-        if let upstream::UpstreamKind::FakeIp { store } = &self.default.kind {
-            store.set_strategy(s);
-        }
     }
 
     /// 重置所有 FakeIP 存储（参照 sing-box `cacheFile.FakeIPReset()`）。
     ///
-    /// 遍历所有 fakeip upstream（含 default），调用 `FakeIpStore::reset()`
-    /// 清空内存映射 + 持久化表，并把分配指针回退到 range 起点。
+    /// 遍历所有 fakeip upstream（含 default，default 即 upstreams 中的一个），
+    /// 调用 `FakeIpStore::reset()` 清空内存映射 + 持久化表，
+    /// 并把分配指针回退到 range 起点。
     /// 用于 Clash API `POST /cache/fakeip/flush`。
     pub fn reset_fakeip(&self) {
         let mut count = 0;
@@ -331,11 +330,6 @@ impl DnsResolver {
                 store.reset();
                 count += 1;
             }
-        }
-        // default upstream 也可能是 fakeip
-        if let upstream::UpstreamKind::FakeIp { store } = &self.default.kind {
-            store.reset();
-            count += 1;
         }
         if count == 0 {
             tracing::debug!("reset_fakeip: no fakeip upstream configured");
