@@ -1212,7 +1212,7 @@ async fn process_ipv4(
     tcp_nat: Arc<TcpNat>,
     udp_sessions: Arc<Mutex<HashMap<(SocketAddr, SocketAddr), UdpEntry>>>,
     udp_timeout: Duration,
-    local_subnets_v4: &[(Ipv4Addr, u8)>,
+    local_subnets_v4: &[(Ipv4Addr, u8)],
     dns_tx: &Option<DnsQueryTx>,
     dns_hijack: bool,
 ) {
@@ -1315,7 +1315,7 @@ async fn process_ipv6(
     tcp_nat: Arc<TcpNat>,
     udp_sessions: Arc<Mutex<HashMap<(SocketAddr, SocketAddr), UdpEntry>>>,
     udp_timeout: Duration,
-    local_subnets_v6: &[(Ipv6Addr, u8)>,
+    local_subnets_v6: &[(Ipv6Addr, u8)],
     dns_tx: &Option<DnsQueryTx>,
     dns_hijack: bool,
 ) {
