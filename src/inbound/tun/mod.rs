@@ -71,7 +71,7 @@ async fn wait_for_tun_visibility(if_name: &str) {
     warn!(
         interface = %if_name,
         "tun: interface not visible after {}ms, proceeding anyway",
-        TUN_VISIBILITY_MAX_ATTEMPTS * TUN_VISIBILITY_POLL_INTERVAL_MS
+        TUN_VISIBILITY_MAX_ATTEMPTS as u64 * TUN_VISIBILITY_POLL_INTERVAL_MS
     );
 }
 
