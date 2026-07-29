@@ -1,0 +1,818 @@
+use std::{
+    collections::HashMap,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{atomic::Ordering, Arc},
+    task::{Context, Poll},
+};
+
+use bytes::Bytes;
+use portable_atomic::AtomicI64;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::{
+    body::{Frame, Incoming},
+    header::{HeaderName, HeaderValue, HOST},
+    Method, Request, StatusCode, Uri,
+};
+use hyper_util::client::legacy::Client;
+use rand::Rng;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    sync::mpsc,
+};
+use tokio_stream::wrappers::ReceiverStream;
+use tower::Service;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::config::outbound::{TlsConfig, XhttpTransportConfig};
+use crate::outbound::{apply_mark_to_tcp, set_tcp_opts};
+
+// ── 公共接口 ─────────────────────────────────────────────────────────────────
+
+/// 建立一条 XHTTP 双工流。
+pub async fn connect(
+    server: &str,
+    port: u16,
+    cfg: &XhttpTransportConfig,
+    tls: Option<&TlsConfig>,
+    extra_headers: &HashMap<String, String>,
+    routing_mark: u32,
+    resolver: Option<Arc<crate::dns::DnsResolver>>,
+) -> anyhow::Result<XhttpStream> {
+    let tls_enabled = tls.is_some_and(|t| t.enabled);
+    let scheme = if tls_enabled { "https" } else { "http" };
+
+    let host = cfg
+        .host
+        .as_deref()
+        .or_else(|| tls.and_then(|t| t.server_name.as_deref()))
+        .unwrap_or(server);
+
+    let raw_path = cfg.path.as_deref().unwrap_or("/");
+    let path = normalize_path(raw_path);
+    let base_url = format!("{scheme}://{server}:{port}{path}");
+
+    debug!(
+        server,
+        port,
+        tls_enabled,
+        host,
+        %path,
+        raw_path = raw_path,
+        sni = ?tls.and_then(|t| t.server_name.as_deref()),
+        insecure = tls.is_some_and(|t| t.insecure),
+        "xhttp config resolved"
+    );
+
+    let client = build_http_client(tls, cfg, routing_mark, resolver)?;
+
+    let mode = cfg.mode.as_deref().unwrap_or("packet-up");
+
+    let session_id = if mode != "stream-one" {
+        Some(Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+
+    debug!(mode, %base_url, ?session_id, "xhttp connecting");
+
+    let mut headers = cfg.headers.clone();
+    for (k, v) in extra_headers {
+        headers.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    headers
+        .entry("Host".to_string())
+        .or_insert_with(|| host.to_string());
+
+    let shared = Arc::new(XhttpShared {
+        client,
+        base_url,
+        session_id,
+        headers,
+        seq: AtomicI64::new(0),
+        max_post_bytes: cfg.sc_max_each_post_bytes.unwrap_or(1_000_000) as usize,
+        min_post_interval_ms: cfg.sc_min_posts_interval_ms.unwrap_or(0),
+        uplink_method: cfg
+            .uplink_http_method
+            .clone()
+            .unwrap_or_else(|| "POST".to_string()),
+    });
+
+    match mode {
+        "stream-one" => connect_stream_one(shared).await,
+        "stream-up" => connect_stream_up_down(shared).await,
+        _ => connect_packet_up(shared).await,
+    }
+}
+
+// ── 自定义 Connector（打 SO_MARK）────────────────────────────────────────────
+
+/// 在 TCP connect 完成后立即设置 SO_MARK，然后可选地包一层 TLS。
+#[derive(Clone)]
+struct MarkedConnector {
+    mark: u32,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    /// 用于解析连接目标域名（走 dns.proxy_domain_resolver），None 时回退系统 DNS
+    resolver: Option<Arc<crate::dns::DnsResolver>>,
+    /// 覆盖 TLS SNI 和证书校验名。当 server 字段是 IP 但证书签发给域名时
+    /// （例如 vless+xhttp 配置 `server: "1.2.3.4"` + `tls.server_name: "example.com"`），
+    /// 必须显式指定 SNI 为域名，否则 rustls 会按 IP 校验证书而失败。
+    /// None 时回退到 URI host。
+    server_name: Option<String>,
+}
+
+impl MarkedConnector {
+    fn new(
+        mark: u32,
+        tls_cfg: Option<Arc<rustls::ClientConfig>>,
+        resolver: Option<Arc<crate::dns::DnsResolver>>,
+        server_name: Option<String>,
+    ) -> Self {
+        Self {
+            mark,
+            tls: tls_cfg,
+            resolver,
+            server_name,
+        }
+    }
+}
+
+/// hyper 连接类型：裸 TCP 或 TLS over TCP
+#[allow(clippy::large_enum_variant)]
+pub enum MaybeHttps {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl tokio::io::AsyncRead for MaybeHttps {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeHttps::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeHttps::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for MaybeHttps {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeHttps::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeHttps::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeHttps::Plain(s) => Pin::new(s).poll_flush(cx),
+            MaybeHttps::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeHttps::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeHttps::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl hyper::rt::Read for MaybeHttps {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        // hyper 的 ReadBufCursor 内部是 MaybeUninit<u8>，不能强转为 &[u8]：
+        // 未初始化字节被当作 u8 属于 UB（Rust 的初始化模型禁止）。
+        // 改用 tokio::io::ReadBuf::uninit 接受未初始化内存，安全桥接。
+        // 用块作用域让 rb 的可变借用（来自 buf.as_mut()）在 advance 前释放。
+        let n = {
+            // SAFETY: as_mut 返回未初始化的 spare 内存，我们只把它传给
+            // ReadBuf::uninit（不读取其内容），poll_read 填充后按实际填充
+            // 字节数 advance，不访问未初始化部分。
+            let spare = unsafe { buf.as_mut() };
+            let mut rb = ReadBuf::uninit(spare);
+            match tokio::io::AsyncRead::poll_read(self, cx, &mut rb) {
+                Poll::Ready(Ok(())) => rb.filled().len(),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        // SAFETY: n 为 poll_read 实际写入 rb 的字节数，advance 不超过已初始化范围
+        unsafe { buf.advance(n) };
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for MaybeHttps {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(self, cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(self, cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(self, cx)
+    }
+}
+
+impl hyper_util::client::legacy::connect::Connection for MaybeHttps {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        hyper_util::client::legacy::connect::Connected::new()
+    }
+}
+
+impl Service<Uri> for MarkedConnector {
+    type Response = MaybeHttps;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = anyhow::Result<MaybeHttps>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let mark = self.mark;
+        let tls_cfg = self.tls.clone();
+        let resolver = self.resolver.clone();
+        let server_name = self.server_name.clone();
+
+        Box::pin(async move {
+            let host = uri
+                .host()
+                .ok_or_else(|| anyhow::anyhow!("xhttp: missing host in URI"))?;
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
+
+            debug!(uri_host = host, port, "xhttp connector: dialing");
+
+            // DNS 解析（优先走 dns.proxy_domain_resolver，未注入则回退系统 DNS）
+            let addr = crate::outbound::resolve_server_addr(host, port, resolver.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("xhttp: DNS failed for {host}: {e}"))?;
+
+            debug!(%addr, "xhttp connector: resolved");
+
+            // TCP connect → 打 SO_MARK → 设 TCP 选项
+            let tcp = TcpStream::connect(addr).await?;
+            apply_mark_to_tcp(&tcp, mark)?;
+            set_tcp_opts(&tcp)?;
+
+            debug!(local = ?tcp.local_addr(), peer = ?tcp.peer_addr(), mark, "xhttp connector: TCP connected");
+
+            if let Some(tls) = tls_cfg {
+                // SNI 优先用 tls.server_name（处理 server 字段是 IP、证书签发给域名的场景）。
+                // 没有显式 server_name 时回退到 URI host（保留原行为）。
+                let sni_str = server_name.as_deref().unwrap_or(host);
+                let sni = rustls::pki_types::ServerName::try_from(sni_str.to_string())
+                    .map_err(|e| anyhow::anyhow!("xhttp: invalid SNI {sni_str}: {e}"))?;
+                debug!(
+                    sni = sni_str,
+                    uri_host = host,
+                    "xhttp connector: starting TLS handshake"
+                );
+                let connector = tokio_rustls::TlsConnector::from(tls);
+                let tls_stream = connector
+                    .connect(sni, tcp)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("xhttp: TLS handshake failed: {e}"))?;
+                debug!(sni = sni_str, "xhttp connector: TLS handshake ok");
+                return Ok(MaybeHttps::Tls(tls_stream));
+            }
+
+            Ok(MaybeHttps::Plain(tcp))
+        })
+    }
+}
+
+// ── 类型别名：带 mark 的 hyper Client ────────────────────────────────────────
+
+type XhttpClient = Client<MarkedConnector, XhttpBody>;
+
+/// 上行 body 类型：可以是空 body、固定字节、或流式 channel
+enum XhttpBody {
+    Empty(Empty<Bytes>),
+    Full(Full<Bytes>),
+    #[allow(clippy::type_complexity)]
+    Stream(
+        StreamBody<
+            futures_util::stream::Map<
+                ReceiverStream<Bytes>,
+                fn(Bytes) -> Result<Frame<Bytes>, io::Error>,
+            >,
+        >,
+    ),
+}
+
+impl hyper::body::Body for XhttpBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            XhttpBody::Empty(b) => Pin::new(b).poll_frame(cx).map_err(|_| unreachable!()),
+            XhttpBody::Full(b) => Pin::new(b).poll_frame(cx).map_err(|_| unreachable!()),
+            XhttpBody::Stream(b) => Pin::new(b).poll_frame(cx),
+        }
+    }
+}
+
+fn stream_body(rx: mpsc::Receiver<Bytes>) -> XhttpBody {
+    fn wrap(b: Bytes) -> Result<Frame<Bytes>, io::Error> {
+        Ok(Frame::data(b))
+    }
+    XhttpBody::Stream(StreamBody::new(
+        ReceiverStream::new(rx).map(wrap as fn(Bytes) -> Result<Frame<Bytes>, io::Error>),
+    ))
+}
+
+// ── 内部共享状态 ──────────────────────────────────────────────────────────────
+
+struct XhttpShared {
+    client: XhttpClient,
+    base_url: String,
+    session_id: Option<String>,
+    headers: HashMap<String, String>,
+    seq: AtomicI64,
+    max_post_bytes: usize,
+    min_post_interval_ms: u64,
+    uplink_method: String,
+}
+
+impl XhttpShared {
+    fn apply_headers(&self, mut req: Request<XhttpBody>) -> Request<XhttpBody> {
+        for (k, v) in &self.headers {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                req.headers_mut().insert(name, val);
+            }
+        }
+        req
+    }
+
+    fn stream_url(&self) -> String {
+        // Xray xhttp 默认 SessionIDPlacement = PlacementPath，session_id 追加到路径末尾。
+        // base_url 已通过 normalize_path 保证以 '/' 结尾，直接拼接即可。
+        // 与 Xray config.go:appendToPath 行为一致。
+        match &self.session_id {
+            Some(sid) => format!("{}{}", self.base_url, sid),
+            None => self.base_url.clone(),
+        }
+    }
+
+    fn packet_url(&self, seq: i64) -> String {
+        // Xray xhttp 默认 SeqPlacement = PlacementPath，seq 追加到 session_id 之后。
+        // 格式：{base_url}{session_id}/{seq}
+        match &self.session_id {
+            Some(sid) => format!("{}{}/{}", self.base_url, sid, seq),
+            None => self.base_url.clone(),
+        }
+    }
+
+    fn build_request(
+        &self,
+        method: &Method,
+        url: &str,
+        body: XhttpBody,
+    ) -> anyhow::Result<Request<XhttpBody>> {
+        let uri: Uri = url.parse()?;
+        let host = uri.host().unwrap_or("").to_string();
+        debug!(%method, %url, host = %host, "xhttp: building HTTP request");
+        let req = Request::builder()
+            .method(method)
+            .uri(uri.clone())
+            .header(HOST, &host)
+            .body(body)?;
+        // apply custom headers（覆盖同名 header）
+        let mut req = self.apply_headers(req);
+
+        // XPadding：Xray xhttp 默认要求每个请求带 100-1000 字节 padding，
+        // 放在 Referer 头的 query string 里（key=x_padding）。
+        // 参考 Xray xpadding.go:
+        //   - GetNormalizedXPaddingBytes 默认 {From:100, To:1000}
+        //   - ApplyXPaddingToHeader: PlacementQueryInHeader, header="Referer", key="x_padding"
+        //   - GeneratePadding: 默认方法生成全 'X' 字符串
+        //   - IsPaddingValid: 空 padding 直接返回 false → 服务端返回 400
+        // padding 必须在 apply_headers 之后设置，确保不被用户自定义 header 覆盖。
+        let mut rng = rand::thread_rng();
+        let padding_len: usize = rng.gen_range(100..=1000);
+        let padding = "X".repeat(padding_len);
+        let scheme = uri.scheme_str().unwrap_or("https");
+        let authority = uri.authority().map(|a| a.as_str()).unwrap_or("");
+        let path = uri.path();
+        let referer_value = format!("{scheme}://{authority}{path}?x_padding={padding}");
+        if let Ok(val) = HeaderValue::from_str(&referer_value) {
+            req.headers_mut().insert("referer", val);
+        }
+        debug!(padding_len, "xhttp: applied XPadding to Referer header");
+
+        Ok(req)
+    }
+}
+
+// ── 模式 1：stream-one ────────────────────────────────────────────────────────
+
+async fn connect_stream_one(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStream> {
+    let (body_tx, body_rx) = mpsc::channel::<Bytes>(64);
+    let url = shared.stream_url();
+    let method = parse_method(&shared.uplink_method);
+    let req = shared.build_request(&method, &url, stream_body(body_rx))?;
+    debug!("xhttp stream-one: sending request");
+    let resp = shared.client.request(req).await?;
+    debug!(status = %resp.status(), "xhttp stream-one: response received");
+    check_status(resp.status(), "stream-one")?;
+    let read_half = RespBodyReader::new(resp.into_body());
+    debug!("xhttp stream-one: stream established");
+    Ok(XhttpStream::new(read_half, XhttpWriter::Stream(body_tx)))
+}
+
+// ── 模式 2：stream-up + 独立 GET 下行 ────────────────────────────────────────
+
+async fn connect_stream_up_down(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStream> {
+    let down_url = shared.stream_url();
+    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()))?;
+    debug!("xhttp stream-up: sending GET download request");
+    let down_resp = shared.client.request(req).await?;
+    debug!(status = %down_resp.status(), "xhttp stream-up: download response received");
+    check_status(down_resp.status(), "stream-down")?;
+    let read_half = RespBodyReader::new(down_resp.into_body());
+
+    let (body_tx, body_rx) = mpsc::channel::<Bytes>(64);
+    let up_url = shared.stream_url();
+    let method = parse_method(&shared.uplink_method);
+    let req = shared.build_request(&method, &up_url, stream_body(body_rx))?;
+    {
+        let client = shared.client.clone();
+        tokio::spawn(async move {
+            debug!("xhttp stream-up: sending POST upload request (background)");
+            match client.request(req).await {
+                Ok(resp) => {
+                    debug!(status = %resp.status(), "xhttp stream-up: upload response received");
+                    // 检查 HTTP 状态码，4xx/5xx 表示服务端拒绝上行
+                    if let Err(e) = check_status(resp.status(), "stream-up") {
+                        warn!("xhttp stream-up POST rejected: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("xhttp stream-up POST failed: {e}");
+                }
+            }
+        });
+    }
+
+    debug!("xhttp stream-up: stream established");
+    Ok(XhttpStream::new(read_half, XhttpWriter::Stream(body_tx)))
+}
+
+// ── 模式 3：packet-up（默认）─────────────────────────────────────────────────
+
+async fn connect_packet_up(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStream> {
+    let down_url = shared.stream_url();
+    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()))?;
+    debug!("xhttp packet-up: sending GET download request");
+    let down_resp = shared.client.request(req).await?;
+    debug!(status = %down_resp.status(), "xhttp packet-up: download response received");
+    check_status(down_resp.status(), "packet-up/stream-down")?;
+    let read_half = RespBodyReader::new(down_resp.into_body());
+
+    let (up_tx, mut up_rx) = mpsc::channel::<Bytes>(128);
+    {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let mut last_post = std::time::Instant::now();
+            debug!(
+                max_post_bytes = shared.max_post_bytes,
+                min_post_interval_ms = shared.min_post_interval_ms,
+                "xhttp packet-up: upload loop started"
+            );
+            while let Some(chunk) = up_rx.recv().await {
+                // packet-up 模式：每收到一个 chunk 立即发一个 POST，
+                // 不等攒满 max_post_bytes。否则 VLESS 握手包（几十字节）
+                // 永远攒不到 1MB，POST 永远不会发，服务端 VLESS 层读不到
+                // 握手包 → 连接挂死。
+                // 参考 Xray client.go packet-up：每个 chunk 单独发一个 POST。
+                // 仅在 chunk 超过 max_post_bytes 时才拆分（保护服务端缓冲）。
+                let mut remaining = chunk;
+                while !remaining.is_empty() {
+                    let payload: Bytes = if remaining.len() > shared.max_post_bytes {
+                        let split = shared.max_post_bytes;
+                        let mut tail = remaining.split_off(split);
+                        std::mem::swap(&mut tail, &mut remaining);
+                        tail
+                    } else {
+                        std::mem::take(&mut remaining)
+                    };
+
+                    if shared.min_post_interval_ms > 0 {
+                        let elapsed = last_post.elapsed().as_millis() as u64;
+                        if elapsed < shared.min_post_interval_ms {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                shared.min_post_interval_ms - elapsed,
+                            ))
+                            .await;
+                        }
+                    }
+                    if let Err(e) = post_packet(&shared, payload).await {
+                        warn!("xhttp packet-up POST error: {e}");
+                        return;
+                    }
+                    last_post = std::time::Instant::now();
+                }
+            }
+            debug!("xhttp packet-up: upload channel closed, upload loop exiting");
+        });
+    }
+
+    debug!("xhttp packet-up: stream established");
+    Ok(XhttpStream::new(read_half, XhttpWriter::Packet(up_tx)))
+}
+
+async fn post_packet(shared: &XhttpShared, payload: Bytes) -> anyhow::Result<()> {
+    let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
+    let url = shared.packet_url(seq);
+    let method = parse_method(&shared.uplink_method);
+    let payload_len = payload.len();
+    let req = shared.build_request(&method, &url, XhttpBody::Full(Full::new(payload)))?;
+    debug!(seq, payload_len, "xhttp packet-up: POST upload");
+    let resp = shared.client.request(req).await?;
+    debug!(seq, status = %resp.status(), "xhttp packet-up: POST response");
+    check_status(resp.status(), &format!("packet POST {seq}"))
+}
+
+// ── 下行响应体读取器 ──────────────────────────────────────────────────────────
+
+struct RespBodyReader {
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+    current: Bytes,
+}
+
+impl RespBodyReader {
+    fn new(body: Incoming) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let mut stream = body;
+            let mut total_bytes = 0u64;
+            let mut frame_count = 0u64;
+            loop {
+                match stream.frame().await {
+                    None => {
+                        debug!(
+                            total_bytes,
+                            frame_count, "xhttp download: stream ended (no more frames)"
+                        );
+                        break;
+                    }
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            frame_count += 1;
+                            total_bytes += data.len() as u64;
+                            if tx.send(Ok(data)).await.is_err() {
+                                debug!(
+                                    total_bytes,
+                                    frame_count, "xhttp download: consumer dropped, stopping"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!(
+                            error = %e,
+                            total_bytes,
+                            frame_count,
+                            "xhttp download: frame error"
+                        );
+                        let _ = tx
+                            .send(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            rx,
+            current: Bytes::new(),
+        }
+    }
+}
+
+impl AsyncRead for RespBodyReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.current.is_empty() {
+            let n = buf.remaining().min(this.current.len());
+            buf.put_slice(&this.current[..n]);
+            this.current = this.current.slice(n..);
+            return Poll::Ready(Ok(()));
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(Some(Ok(chunk))) => {
+                if chunk.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                let n = buf.remaining().min(chunk.len());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    this.current = chunk.slice(n..);
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+// ── XhttpStream：对外暴露的双工流 ─────────────────────────────────────────────
+
+pub struct XhttpStream {
+    reader: RespBodyReader,
+    writer: XhttpWriter,
+}
+
+enum XhttpWriter {
+    Stream(mpsc::Sender<Bytes>),
+    Packet(mpsc::Sender<Bytes>),
+}
+
+impl XhttpStream {
+    fn new(reader: RespBodyReader, writer: XhttpWriter) -> Self {
+        Self { reader, writer }
+    }
+}
+
+impl AsyncRead for XhttpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for XhttpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let tx = match &this.writer {
+            XhttpWriter::Stream(tx) | XhttpWriter::Packet(tx) => tx.clone(),
+        };
+        match tx.try_send(Bytes::copy_from_slice(data)) {
+            Ok(()) => Poll::Ready(Ok(data.len())),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    let _ = tx.reserve().await;
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "xhttp: upload channel closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let (dead_tx, _) = mpsc::channel(1);
+        match &mut this.writer {
+            XhttpWriter::Stream(tx) => *tx = dead_tx,
+            XhttpWriter::Packet(tx) => *tx = dead_tx,
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+// ── HTTP Client 构建 ──────────────────────────────────────────────────────────
+
+fn build_http_client(
+    tls: Option<&TlsConfig>,
+    _cfg: &XhttpTransportConfig,
+    routing_mark: u32,
+    resolver: Option<Arc<crate::dns::DnsResolver>>,
+) -> anyhow::Result<XhttpClient> {
+    let tls_enabled = tls.is_some_and(|t| t.enabled);
+
+    let rustls_cfg: Option<Arc<rustls::ClientConfig>> = if tls_enabled {
+        if let Some(tls_cfg) = tls {
+            // 克隆 TlsConfig 以强制 ALPN=h2，不影响原始配置
+            let mut tls_cfg_clone = tls_cfg.clone();
+            // XHTTP 三种模式（stream-one/stream-up/packet-up）都依赖 HTTP/2 的
+            // 流式语义：单次 POST 上行长连接 + 独立 GET 下行长连接。
+            // HTTP/1.1 请求-响应串行机制根本无法工作，服务端（Xray/sing-box）
+            // 都是 HTTP/2-only。与 Xray xhttp 配置 `downloadSettings.streamSettings`
+            // 一致：必须 h2，禁止 http/1.1。
+            let original_alpn = tls_cfg_clone.alpn.clone();
+            tls_cfg_clone.alpn = vec!["h2".to_string()];
+            debug!(
+                original_alpn = ?original_alpn,
+                forced_alpn = ?tls_cfg_clone.alpn,
+                insecure = tls_cfg_clone.insecure,
+                "xhttp: building rustls client config (ALPN forced to h2)"
+            );
+            Some(crate::outbound::tls::build_client_config(&tls_cfg_clone)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 提取 tls.server_name：用于覆盖 TLS SNI（当 server 字段是 IP 但证书签发给域名时必需）
+    let server_name = tls.and_then(|t| t.server_name.clone());
+
+    let connector = MarkedConnector::new(routing_mark, rustls_cfg, resolver, server_name);
+
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new())
+        .http2_only(true)
+        .build(connector);
+
+    Ok(client)
+}
+
+// ── 辅助函数 ──────────────────────────────────────────────────────────────────
+
+fn parse_method(s: &str) -> Method {
+    Method::from_bytes(s.as_bytes()).unwrap_or(Method::POST)
+}
+
+fn check_status(status: StatusCode, ctx: &str) -> anyhow::Result<()> {
+    if status.is_success() {
+        debug!(status = %status, ctx, "xhttp: HTTP status ok");
+        Ok(())
+    } else {
+        warn!(status = %status, ctx, "xhttp: HTTP status error");
+        anyhow::bail!("xhttp {ctx}: server returned {status}")
+    }
+}
+
+/// 确保路径以 '/' 开头，并以 '/' 结尾（与 Xray 行为一致）
+fn normalize_path(path: &str) -> String {
+    let p = if path.is_empty() || !path.starts_with('/') {
+        format!("/{path}")
+    } else {
+        path.to_string()
+    };
+    if !p.ends_with('/') {
+        format!("{p}/")
+    } else {
+        p
+    }
+}
+
+// ── 单元测试 ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_path;
+
+    #[test]
+    fn test_normalize_path() {
+        assert_eq!(normalize_path(""), "/");
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("ws"), "/ws/");
+        assert_eq!(normalize_path("/ws"), "/ws/");
+        assert_eq!(normalize_path("/ws/"), "/ws/");
+        assert_eq!(normalize_path("/a/b"), "/a/b/");
+    }
+}

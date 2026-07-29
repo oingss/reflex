@@ -1,0 +1,150 @@
+[package]
+name = "reflex"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "reflex"
+path = "src/main.rs"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+portable-atomic  = { version = "1", features = ["fallback"] }
+tikv-jemallocator = { version = "0.6", optional = true }
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+serde_yaml       = "0.9"
+thiserror        = "1"
+anyhow           = "1"
+tokio            = { version = "1", features = ["full"] }
+bytes            = "1"
+socket2          = { version = "0.5", features = ["all"] }
+libc             = "0.2"
+dashmap          = "5"
+lru              = "0.12"
+tracing          = "0.1"
+async-trait      = "0.1"
+futures-util     = "0.3"
+tokio-stream     = "0.1"
+uuid             = { version = "1", features = ["v4"] }
+pin-project-lite = "0.2"
+redb             = "2"
+ureq             = "2"
+reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream", "http2"] }
+flate2           = "1"
+base64           = "0.22"
+h2               = "0.4"
+hyper            = { version = "1", features = ["http1", "http2", "client"] }
+hyper-util       = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
+http-body-util   = "0.1"
+tower            = { version = "0.5", features = ["util"] }
+http             = "1"
+regex            = "1"
+ahash            = "0.8"
+fst              = "0.4"
+tun              = { version = "0.8", features = ["async"] }
+# 用户态协议栈（gvisor/mixed TUN stack）：基于 smoltcp，平台无关。
+# 代码已合并到 src/inbound/tun/netstack/，不再是独立 crate。
+smoltcp          = { version = "0.13", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "async",
+    "socket-tcp-cubic",
+]}
+etherparse       = "0.20"
+# netstack 模块使用 futures（AtomicWaker / Stream / Sink）和 log（smoltcp 日志）
+futures          = "0.3"
+log              = "0.4"
+# RuleSet 文件热更新：notify 提供 inotify/FSEvents/ReadDirectoryChangesW 抽象
+notify           = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# outbound 出站协议依赖（原 outbound-net feature，现已默认启用）
+tokio-rustls        = { version = "0.26" }
+rustls              = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-native-certs = { version = "0.8" }
+rustls-pemfile      = { version = "2" }
+tokio-tungstenite   = { version = "0.24", features = ["rustls-tls-native-roots"] }
+quinn               = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# ShadowQuic 出站：内部使用 quinn-jls（JLS SNI 伪装的 quinn 分支），与 reflex 自带的 quinn 0.11 互不冲突
+shadowquic          = { version = "0.3.7", default-features = false, features = ["shadowquic-quinn", "ring"] }
+# 版本锁定：阻止 cargo 把传递依赖升级到不兼容的 quinn-*-jls 0.3.6。
+# shadowquic 0.3.11 编写时基于 quinn-jls 0.3.4 / quinn-proto-jls 0.3.5，
+# 但 quinn-*-jls 0.3.6 更改了 congestion::Controller trait 的 on_congestion_event
+# 签名（5→6 参数），导致 shadowquic 0.3.11 无法编译。此处锁定到兼容版本。
+quinn-jls           = { version = "=0.3.4", default-features = false }
+quinn-proto-jls     = { version = "=0.3.5", default-features = false }
+# VMess 加密（AES-GCM 握手 + ChaCha20-Poly1305 数据层）
+aes              = { version = "0.8"  }
+aes-gcm          = { version = "0.10" }
+chacha20poly1305 = { version = "0.10" }
+hmac             = { version = "0.12" }
+sha2             = { version = "0.10" }
+sha3             = { version = "0.10" }
+md-5             = { version = "0.10" }
+sha1             = { version = "0.10" }
+blake3           = { version = "1"    }
+blake2           = { version = "0.10" }
+# VMess AuthID CRC32 + FNV header checksum
+crc32fast        = { version = "1" }
+fnv              = { version = "1" }
+# REALITY 依赖
+x25519-dalek     = { version = "2", features = ["static_secrets"] }
+hkdf             = { version = "0.12" }
+hex              = { version = "0.4" }
+rand             = { version = "0.8" }
+# gRPC 传输：prost 用于 protobuf varint 编解码（h2 在上方已作为非可选依赖引入）
+prost            = { version = "0.13" }
+# DoH3（DNS-over-HTTP/3）：h3 协议层 + h3-quinn 适配 quinn 0.11
+h3               = { version = "0.0.8" }
+h3-quinn         = { version = "0.0.10" }
+# SSH 出站：russh 客户端（async-trait + rsa 算法），dirs 解析 ~/.ssh，totp-rs 提供 2FA
+russh            = { version = "0.51", default-features = false, features = ["async-trait"] }
+dirs             = { version = "5" }
+totp-rs          = { version = "5", features = ["serde_support"] }
+# Tailscale 出站：tailscale-rs userspace netstack
+tailscale        = { version = "0.3" }
+
+# TUN auto_route 平台原生实现依赖
+once_cell        = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink            = "0.14"
+netlink-packet-route = "0.19"
+netlink-packet-core  = "0.7"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
+    "Win32_System_Memory",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+]}
+
+[lib]
+name = "reflex"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "=3.13.0"
+tokio    = { version = "1", features = ["full"] }
+rcgen    = "0.13"
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+strip         = "symbols"  # 剥离调试符号表，不影响运行
+debug         = false      # 不内嵌调试信息
+lto           = true       # fat LTO：完整跨 crate 内联分析，比 "thin" 多榨 3-8% 吞吐
+codegen-units = 1          # 单编译单元，允许更完整的内联分析
+panic         = "abort"    # panic 直接退出，去掉 unwind 运行时；proxy 场景无影响
