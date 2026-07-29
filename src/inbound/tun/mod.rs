@@ -61,7 +61,7 @@ const TUN_VISIBILITY_POLL_INTERVAL_MS: u64 = 50;
 /// 新创建的 TUN 设备可能不会立即被系统网络子系统识别，需轮询等待。
 /// 在所有平台（Linux/macOS/Windows）上调用。
 async fn wait_for_tun_visibility(if_name: &str) {
-    for attempt in 0..TUN_VISIBILITY_MAX_ATTEMPTS {
+    for _attempt in 0..TUN_VISIBILITY_MAX_ATTEMPTS {
         // 尝试通过 tun_name() 获取设备名验证（tun 0.8 保证 tun_name() 返回真实名）
         if is_tun_interface_visible(if_name) {
             return;
