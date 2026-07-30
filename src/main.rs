@@ -92,10 +92,14 @@ fn print_adguard_report(report: &AdGuardConvertReport) {
 
 /// `reflex ruleset <input.yaml|input.json|input.txt> -o <output.rrs> [-t adguard|yaml]`
 /// 支持：
-/// - mihomo / Clash `payload:` yaml 规则集（自动探测，或用 `-t yaml` 强制指定）
-/// - sing-box JSON 格式（rule-set）
-/// - reflex 原生文本格式
-/// - AdGuardHome / AdBlock 风格的 .txt 过滤规则（自动探测，或用 `-t adguard` 强制指定）
+/// - mihomo / Clash `payload:` yaml 规则集（按 `.yaml`/`.yml` 扩展名自动探测，或用 `-t yaml` 强制指定）
+/// - sing-box JSON 格式（rule-set）（按 `.json` 扩展名自动探测）
+/// - AdGuardHome / AdBlock 风格的 .txt 过滤规则（按 `.txt` 扩展名自动探测，或用 `-t adguard` 强制指定）
+/// - reflex 原生文本格式（扩展名缺失/不识别时的内容嗅探兜底之一）
+///
+/// 自动探测优先级：先看文件扩展名（.json/.yaml/.yml/.txt），扩展名缺失或不认识
+/// 时才回退到内容嗅探（首行 `payload:` → yaml；`{` 开头 → json；否则先试原生
+/// 文本格式，失败再按 AdGuardHome/AdBlock 解析）。
 fn cmd_ruleset(args: &[String]) -> anyhow::Result<()> {
     // args[0] == "ruleset", args[1] == input, rest contains -o / -t
     if args.len() < 4 {
@@ -138,29 +142,45 @@ fn cmd_ruleset(args: &[String]) -> anyhow::Result<()> {
                 other
             ));
         }
-        // 未指定 -t：自动判断格式
-        None if input.ends_with(".json") || src.trim_start().starts_with('{') => {
-            // JSON → sing-box rule-set（Source Rule Set）
-            CompiledRuleSet::from_singbox_json(&src)?
-        }
-        None if looks_like_mihomo_yaml(&src) => {
-            // mihomo / Clash `payload:` yaml 规则集
-            CompiledRuleSet::from_mihomo_yaml(&src, None)?
-        }
+        // 未指定 -t：优先按文件扩展名判断格式，扩展名缺失或无法识别时才回退到
+        // 内容嗅探（避免像 "#TITLE=...\npayload:\n..." 这类带头部注释的 .yaml
+        // 文件因为「首行不是 payload:」而被误判）。
         None => {
-            // 先尝试 reflex 原生 "key: value" 文本格式；
-            // 解析失败则视为 AdGuardHome / AdBlock 风格的 .txt 过滤规则
-            // （参考 sing-box `rule-set convert -t adguard` 的能力）。
-            match CompiledRuleSet::from_text(&src) {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!(
-                        "[info] '{}' 不是 reflex 原生文本规则格式，按 AdGuardHome/AdBlock 规则解析",
-                        input
-                    );
+            let ext = lowercase_extension(input);
+            match ext.as_deref() {
+                // .json → sing-box rule-set（Source Rule Set）
+                Some("json") => CompiledRuleSet::from_singbox_json(&src)?,
+                // .yaml / .yml → mihomo / Clash `payload:` 规则集
+                Some("yaml") | Some("yml") => CompiledRuleSet::from_mihomo_yaml(&src, None)?,
+                // .txt → AdGuardHome / AdBlock 风格过滤规则
+                Some("txt") => {
                     let report = CompiledRuleSet::from_adguard_text(&src)?;
                     print_adguard_report(&report);
                     report.ruleset
+                }
+                // 扩展名缺失或不是上述三种：回退到原有的内容嗅探逻辑
+                _ => {
+                    if src.trim_start().starts_with('{') {
+                        CompiledRuleSet::from_singbox_json(&src)?
+                    } else if looks_like_mihomo_yaml(&src) {
+                        CompiledRuleSet::from_mihomo_yaml(&src, None)?
+                    } else {
+                        // 先尝试 reflex 原生 "key: value" 文本格式；
+                        // 解析失败则视为 AdGuardHome / AdBlock 风格的 .txt 过滤规则
+                        // （参考 sing-box `rule-set convert -t adguard` 的能力）。
+                        match CompiledRuleSet::from_text(&src) {
+                            Ok(c) => c,
+                            Err(_) => {
+                                eprintln!(
+                                    "[info] '{}' 不是 reflex 原生文本规则格式，按 AdGuardHome/AdBlock 规则解析",
+                                    input
+                                );
+                                let report = CompiledRuleSet::from_adguard_text(&src)?;
+                                print_adguard_report(&report);
+                                report.ruleset
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -187,6 +207,14 @@ fn looks_like_mihomo_yaml(src: &str) -> bool {
     let first_line = src.trim_start().lines().next().unwrap_or("");
     let lower = first_line.to_ascii_lowercase();
     lower.starts_with("payload:") || lower.starts_with("payload :")
+}
+
+/// 取文件名的小写扩展名（不含点），例如 "geosite-ads.YAML" → Some("yaml")。
+fn lowercase_extension(input: &str) -> Option<String> {
+    std::path::Path::new(input)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
 }
 
 /// `reflex inspect <input.rrs>` — 查看二进制规则集统计
