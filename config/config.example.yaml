@@ -1,0 +1,780 @@
+# reflex 配置示例（YAML 版本，等价于 config.example.json）
+#
+# 加载方式：
+#   reflex -c config.yaml
+#   reflex -d /etc/reflex        # 自动查找 config.json → config.yaml → 唯一 .json/.yaml/.yml
+#
+# 注意：
+# - YAML 原生支持 # 注释；不像 JSON 那样需要 // 注释剥离
+# - 含 `:`、`#`、`!`、`@` 或特殊字符的字符串值必须加引号
+#   （如 URL、`rcode://refused`、`geosite-geolocation-!cn` 等）
+# - 列表元素用 `- ` 前缀；缩进必须用空格，不能用 Tab
+
+# ── DNS 配置 ──────────────────────────────────────────────────────────────
+dns:
+  servers:
+    # ── UDP DNS（最基础，默认端口 53）────────────────────────────────────
+    # 两种写法等价：裸 IP / 显式 udp:// 前缀
+    - tag: local
+      address: "223.5.5.5"            # 阿里 DNS；也可用 "119.29.29.29"（腾讯）
+      detour: direct
+      timeout: 5
+    - tag: local-udp
+      address: "udp://223.5.5.5:53"   # 显式 udp:// 前缀写法
+      detour: direct
+      timeout: 5
+
+    # ── TCP DNS ──────────────────────────────────────────────────────────
+    - tag: local-tcp
+      address: "tcp://223.5.5.5"
+      detour: direct
+      timeout: 5
+
+    # ── DNS-over-HTTPS（DoH）────────────────────────────────────────────
+    - tag: remote
+      address: "https://1.1.1.1/dns-query"
+      detour: "🚀 节点选择"
+      timeout: 5
+    - tag: remote-doh-domain
+      address: "https://dns.google/dns-query"
+      domain_resolver: local          # address 为域名时用哪个 server 解析它
+      detour: "🚀 节点选择"
+      timeout: 5
+      # client_subnet: "1.2.3.0/24"    # EDNS Client Subnet（可选）
+      # insecure: false               # 跳过 TLS 证书验证（仅调试用）
+
+    # ── DNS-over-TLS（DoT）──────────────────────────────────────────────
+    - tag: remote-dot
+      address: "tls://1.1.1.1:853"
+      sni: cloudflare-dns.com         # address 为 IP 时建议显式填 SNI
+      detour: "🚀 节点选择"
+      timeout: 5
+
+    # ── DNS-over-QUIC（DoQ）─────────────────────────────────────────────
+    - tag: remote-doq
+      address: "quic://dns.adguard.com"
+      sni: dns.adguard.com
+      timeout: 5
+
+    # ── DNS-over-HTTP/3（DoH3，QUIC + HTTP/3）──────────────────────────
+    # 相比 DoH 在弱网下握手更省 RTT；需启用 outbound-net feature 编译
+    - tag: remote-doh3
+      address: "h3://1.1.1.1/dns-query"
+      detour: "🚀 节点选择"
+      timeout: 5
+
+    # ── 本地 hosts 文件 DNS（对齐 sing-box hosts.Transport）────────────
+    # 直接读 /etc/hosts，不发起任何网络查询；用于内网域名或屏蔽
+    - tag: hosts
+      address: "hosts://"             # 也可 "hosts:///etc/hosts" 指定路径
+      # 优先级：匹配到的条目 → 回落到其他 server（不写则仅返回 hosts 命中）
+
+    # ── 本地系统 DNS（对齐 sing-box local.Transport）────────────────────
+    # 读 /etc/resolv.conf + /etc/hosts，按系统 resolver 行为查询
+    - tag: local-system
+      address: "local://"
+      timeout: 5
+
+    # ── 内置响应码（拦截用）─────────────────────────────────────────────
+    # 三种内置动作：
+    #   refused   → 返回 REFUSED（客户端应退避）
+    #   success   → 返回空 NOERROR（用于"已屏蔽但勿报错"的伪装成功）
+    #   nxdomain  → 返回 NXDOMAIN（域名不存在）
+    - tag: block-dns
+      address: "rcode://refused"
+    - tag: block-dns-success
+      address: "rcode://success"
+    - tag: block-dns-nxdomain
+      address: "rcode://nxdomain"
+
+    # ── FakeIP ───────────────────────────────────────────────────────────
+    # 排除某些域名不走 FakeIP 的做法与 sing-box 一致：在 dns.rules 中把排除规则
+    # 放在 fakeip 规则之前，让该域名走真实上游即可。例如：
+    #   - domain_suffix: [lan, local, internal, corp]
+    #     server: local
+    #   - query_type: [A, AAAA]
+    #     server: fakeip
+    - tag: fakeip
+      address: "fakeip://"
+      fakeip:
+        inet4_range: "198.18.0.0/15"
+        inet6_range: "fc00::/18"
+
+  rules:
+    - ruleset: [geosite-ads]
+      server: block-dns
+    - ruleset: [geosite-cn]
+      server: local
+    - query_type: [A, AAAA]
+      server: fakeip
+
+  final: remote
+  strategy: ipv4_only
+  # 代理出站节点的 server 字段是域名时，用哪个 DNS server tag 解析它。
+  # 等价于 sing-box route.default_domain_resolver（DomainResolveOptions）。
+  # 支持两种写法：
+  #   1) 简写（只给 server tag）：
+  #        proxy_domain_resolver: local
+  #      strategy 沿用上面的全局 strategy，启用缓存。
+  #   2) 完整对象：
+  #        proxy_domain_resolver:
+  #          server: local
+  #          strategy: prefer_ipv4
+  #          disable_cache: false
+  #      strategy 不填则沿用全局；disable_cache 默认 false。
+  proxy_domain_resolver: local
+  disable_cache: false
+  disable_hosts: false                # true 时跳过系统 hosts 文件查询
+  cache_capacity: 4096
+  cache_ttl_max: 3600
+  optimistic_timeout: 180
+
+# ── 入站配置 ─────────────────────────────────────────────────────────────
+inbounds:
+  - type: tproxy
+    tag: tproxy-in
+    listen: "0.0.0.0"
+    listen_port: 7893
+    mark: 1
+  - type: mixed
+    tag: mixed-in
+    listen: "127.0.0.1"
+    listen_port: 7890
+  # 纯 HTTP 代理入站（CONNECT 隧道 + 转发代理）
+  # 认证可选：users 为空或省略则不鉴权；填写后使用 Proxy-Authorization: Basic
+  - type: http
+    tag: http-in
+    listen: "127.0.0.1"
+    listen_port: 2080
+    # users:
+    #   - username: admin
+    #     password: secret
+  # 纯 SOCKS5 代理入站（CONNECT + UDP ASSOCIATE）
+  # 认证可选：users 为空或省略则不鉴权；填写后使用 RFC 1929 用户名/密码子协商
+  - type: socks
+    tag: socks-in
+    listen: "127.0.0.1"
+    listen_port: 1080
+    # users:
+    #   - username: admin
+    #     password: secret
+  - type: dns
+    tag: dns-in
+    listen: "127.0.0.1"
+    listen_port: 5353
+  - type: tun
+    tag: tun-in
+    interface_name: tun0
+    mtu: 9000
+    address:
+      - "198.18.0.1/16"
+      - "fd00::1/126"
+    auto_route: true
+    iproute2_table_index: 2022
+    iproute2_rule_index: 9000
+    strict_route: true
+    stack: system
+    exclude_interface: [eth0]
+    exclude_uid: [0]
+    udp_timeout: 300
+
+# ── 路由配置 ─────────────────────────────────────────────────────────────
+route:
+  # ── 出口网络配置（与 sing-box route 顶层字段对齐）──────────────────────
+  # auto_detect_interface：自动检测并绑定默认出口网络接口（Linux/macOS/Windows）。
+  #   启用后，direct 出站会跟随系统路由表自动选择接口，解决多网卡/VPN 环境下
+  #   直连流量走错接口的问题。与 sing-box route.auto_detect_interface 对齐。
+  auto_detect_interface: true
+  ipv6: true
+  default_mark: 1789
+  # default_interface：强制指定出口接口名称（覆盖 auto_detect_interface）。
+  #   填写后所有 direct 连接绑定到该接口。不填时依赖自动检测或系统默认。
+  #   与 sing-box route.default_interface 对齐。
+  #   示例：default_interface: eth0
+  #
+  # default_mark：Linux fwmark，用于配合 iptables/nftables 策略路由，
+  #   避免代理流量形成回环。仅 Linux 有效。
+  #   与 sing-box route.default_mark 对齐。
+  #   示例：default_mark: 100
+
+  rules:
+    # ── 协议嗅探 ────────────────────────────────────────────────────────
+    # 对所有流量先做嗅探（TLS SNI / HTTP Host / QUIC / SSH / BitTorrent），
+    # 用嗅探结果更新目标域名后重新路由。必须放在规则链最前面。
+    - sniff: true
+      sniff_type: [tls, http, quic, ssh, bittorrent]
+      sniff_timeout_ms: 300
+      sniff_override_destination: false
+
+    # ── DNS 劫持 ─────────────────────────────────────────────────────────
+    - hijack_dns: true
+      protocol: [dns]
+    - hijack_dns: true
+      inbound: [dns-in]
+
+    # ── 广告拦截 ─────────────────────────────────────────────────────────
+    - ruleset: [geosite-ads]
+      outbound: block
+
+    # ── 私有地址 → 直连 ──────────────────────────────────────────────────
+    - private_ip: true
+
+    # ── 域名正则匹配（domain_regex）──────────────────────────────────────
+    # 匹配目标域名，大小写不敏感，语义为 OR（任意一条正则命中即可）。
+    # 与 sing-box domain_regex 字段完全对齐。
+    # 典型用法：匹配 Google 全系域名走代理
+    - domain_regex:
+        - "^.*\\.google\\.com$"
+        - "^.*\\.googleapis\\.com$"
+        - "^.*\\.gstatic\\.com$"
+        - "^.*\\.googlevideo\\.com$"
+      outbound: "🚀 节点选择"
+
+    # ── 来源 IP CIDR（source_ip_cidr）────────────────────────────────────
+    # 匹配连接的来源地址，支持 IPv4/IPv6 CIDR，语义为 OR。
+    # 与 sing-box source_ip_cidr 字段完全对齐。
+    # 与其他目标条件之间是 AND 语义（两者同时需满足）。
+    #
+    # 示例 1：仅允许来自局域网的流量走直连
+    - source_ip_cidr:
+        - "192.168.0.0/16"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+      outbound: direct
+    # 示例 2：来自局域网 AND 目标是国内域名 → 直连（AND 语义）
+    # - source_ip_cidr:
+    #     - "192.168.0.0/16"
+    #   domain_suffix:
+    #     - ".cn"
+    #   outbound: direct
+
+    # ── 规则反转（invert）────────────────────────────────────────────────
+    # 反转所有匹配条件的聚合结果（逻辑 NOT）。
+    # 与 sing-box invert 字段完全对齐。
+    # 示例 1：非国内域名走代理（等价于"其余所有域名"）
+    # - ruleset: [geosite-cn]
+    #   invert: true
+    #   outbound: "🚀 节点选择"
+    # 示例 2：非国内 IP → 代理
+    # - ruleset: [geoip-cn]
+    #   invert: true
+    #   outbound: "🚀 节点选择"
+
+    # ── Clash API 模式（clash_mode）──────────────────────────────────────
+    # 仅当 Clash API 当前模式（Dashboard 上切换、或 PATCH /configs 写入）
+    # 等于该值时才命中，大小写不敏感。与 sing-box clash_mode 规则条件对齐。
+    # 注意："global"/"direct" 本身没有任何硬编码行为，必须像下面这样显式
+    # 写规则才会生效——把它们放在规则链最前面（仅次于嗅探/DNS 劫持）。
+    # - clash_mode: global
+    #   outbound: "🚀 节点选择"
+    # - clash_mode: direct
+    #   outbound: direct
+
+    # ── 目标地址/端口改写（override_address / override_port）──────────────
+    # 命中后改写实际转发目标，不影响匹配本身用到的原始地址。
+    # 与 sing-box override_address / override_port 对齐。
+    # 示例：把局域网内某个域名重定向到另一台机器的另一个端口
+    # - domain: printer.local
+    #   override_address: "192.168.1.50"
+    #   override_port: 9100
+    #   outbound: direct
+
+    # ── UDP 会话超时覆盖（udp_timeout）───────────────────────────────────
+    # 命中后覆盖该连接的 UDP 会话空闲超时（秒），不影响其他规则。
+    # 与 sing-box udp_timeout 对齐。游戏/直播等长连接场景适合调大。
+    # - domain_suffix:
+    #     - ".game.example.com"
+    #   network: udp
+    #   udp_timeout: 300
+    #   outbound: direct
+
+    # ── 国内 IP 和域名 → 直连 ────────────────────────────────────────────
+    - ruleset: [geosite-cn]
+      outbound: direct
+    - resolve: true
+      server: remote
+    - ruleset: [geoip-cn]
+      outbound: direct
+
+  # 默认出站：未命中规则的流量进入 selector 节点组
+  final: "🚀 节点选择"
+
+  # 规则集文件声明
+  rule_set:
+    # 本地 binary 格式（默认，预编译 .rrs 文件）
+    - tag: geosite-cn
+      type: local
+      path: "/etc/reflex/rules/geosite-cn.rrs"
+    # 本地 source 格式（sing-box JSON，运行时自动编译，无需预编译）
+    - tag: geosite-ads
+      type: local
+      format: source
+      path: "/etc/reflex/rules/geosite-ads.json"
+    # 远程 binary 格式，每 24 小时自动更新
+    - tag: geoip-cn
+      type: remote
+      format: binary
+      url: "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.srs"
+      path: "/var/cache/reflex/geoip-cn.rrs"
+      download_detour: direct
+      update_interval: "24h"
+    # 远程 source 格式（sing-box JSON），每 12 小时更新，通过代理下载
+    - tag: "geosite-geolocation-!cn"   # YAML 中 `!` 是 tag 标记，必须加引号
+      type: remote
+      format: source
+      url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.json"
+      path: "/var/cache/reflex/geosite-geolocation-not-cn.json"
+      download_detour: proxy
+      update_interval: "12h"
+
+# ── 实验性功能 ───────────────────────────────────────────────────────────
+experimental:
+  cache_file:
+    enabled: true
+    path: cache.db
+    store_fakeip: true
+  clash_api:
+    # 总开关：启用 Clash API（/version /proxies /traffic 等接口）。
+    # - true：监听 external_controller，提供 API
+    # - false：clash_api 完全不启动
+    enabled: true
+    default_mode: rule
+    mode_list: [rule, global, direct]
+    external_controller: "0.0.0.0:9090"
+    secret: ""
+    # Web UI 静态文件目录；为空则不提供 UI 文件服务。
+    # 与 sing-box `external_ui` 字段对齐。
+    # 启动时若该目录不存在或为空，会自动从 external_ui_download_url 下载并解压。
+    external_ui: "ui"
+    # Web UI 自动下载 URL（zip 格式）。不填时默认使用 metacubexd 最新 release。
+    # 与 sing-box `external_ui_download_url` 字段对齐。
+    # external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/releases/latest/download/compressed-dist.tgz"
+    # 下载 UI 时使用的出站 tag（选填）。
+    # external_ui_download_detour: direct
+    # 访问 http://<external_controller>/  会 302 重定向到 /ui/，自动打开面板。
+    # 若设了 secret，可在 URL 里带 ?secret=xxx 免填：
+    #   http://127.0.0.1:9090/ui/?secret=your-secret
+    access_control_allow_origin: []
+    access_control_allow_private_network: false
+
+# ── 出站配置 ─────────────────────────────────────────────────────────────
+outbounds:
+  - type: selector
+    tag: "🚀 节点选择"
+    outbounds: [自动选择, proxy, vmess-ws-tls, vmess-tcp, vmess-grpc, vless-grpc, trojan-grpc, ss-grpc, tuic-proxy, hy2-proxy, naive-proxy, shadowquic-proxy, ssh-proxy, tailscale-proxy, direct]
+    default: 自动选择
+  - type: url-test
+    tag: 自动选择
+    outbounds: [proxy, vmess-ws-tls, vmess-tcp, vmess-grpc, vless-grpc, trojan-grpc, ss-grpc, tuic-proxy, hy2-proxy, naive-proxy, shadowquic-proxy]
+    url: "https://www.gstatic.com/generate_204"
+    interval: "3m"
+    idle_timeout: "30m"
+    tolerance: 50
+  - type: vless
+    tag: proxy-ws-tls
+    server: your.domain.com
+    server_port: 443
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    transport:
+      type: ws
+      path: "/your-path"
+      headers:
+        Host: your.domain.com
+    tls:
+      enabled: true
+      server_name: your.domain.com
+      insecure: false
+      alpn: [h2, "http/1.1"]   # 含 / 的字符串最好加引号
+      utls:
+        enabled: true
+        fingerprint: chrome
+  - type: socks
+    tag: socks-proxy
+    server: "127.0.0.1"
+    server_port: 1080
+    version: "5"
+    username: user
+    password: pass
+  - type: vless
+    tag: proxy-reality
+    server: your.server.ip
+    server_port: 443
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    tls:
+      enabled: true
+      server_name: www.apple.com
+      reality:
+        enabled: true
+        public_key: "服务端x25519公钥(base64url)"
+        short_id: abcdef01
+  # VLESS + XHTTP + TLS
+  - type: vless
+    tag: vless-xhttp-tls
+    server: your.server.ip
+    server_port: 443
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    tls:
+      enabled: true
+      server_name: www.apple.com
+      insecure: false
+    transport:
+      type: xhttp
+      path: "/xhttp"
+      mode: packet-up
+  # VLESS + gRPC + TLS
+  # gRPC 传输基于 HTTP/2，必须启用 TLS 且 alpn 必须包含 h2。
+  # service_name 会拼接成 `/{service_name}/Tun` 路径，需与服务端一致。
+  - type: vless
+    tag: vless-grpc
+    server: your-grpc-server.example.com
+    server_port: 443
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    tls:
+      enabled: true
+      server_name: your-grpc-server.example.com
+      insecure: false
+      alpn: [h2]
+      utls:
+        enabled: true
+        fingerprint: chrome
+    transport:
+      type: grpc
+      service_name: GunService
+      host: your-grpc-server.example.com
+  - type: vmess
+    tag: vmess-ws-tls
+    server: your-vmess-server.example.com
+    server_port: 443
+    uuid: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+    security: auto
+    transport:
+      type: ws
+      path: "/vmess"
+      headers:
+        Host: your-vmess-server.example.com
+    tls:
+      enabled: true
+      server_name: your-vmess-server.example.com
+      insecure: false
+  - type: vmess
+    tag: vmess-tcp
+    server: your-vmess-tcp-server.example.com
+    server_port: 80
+    uuid: "cccccccc-dddd-eeee-ffff-000000000000"
+    security: auto
+    transport:
+      type: tcp
+    tls:
+      enabled: false
+  # VMess + gRPC + TLS
+  # 与 VLESS + gRPC 一致：基于 HTTP/2，TLS alpn 必须包含 h2。
+  - type: vmess
+    tag: vmess-grpc
+    server: your-vmess-grpc-server.example.com
+    server_port: 443
+    uuid: "dddddddd-eeee-ffff-0000-111111111111"
+    security: auto
+    tls:
+      enabled: true
+      server_name: your-vmess-grpc-server.example.com
+      insecure: false
+      alpn: [h2]
+      utls:
+        enabled: true
+        fingerprint: chrome
+    transport:
+      type: grpc
+      service_name: GunService
+      host: your-vmess-grpc-server.example.com
+  - type: shadowsocks
+    tag: ss-proxy
+    server: example.com
+    server_port: 8388
+    method: aes-256-gcm
+    password: your-password
+    multiplex:
+      enabled: false
+      protocol: smux
+      max_connections: 4
+      min_streams: 4
+      max_streams: 0
+      padding: false
+  # Shadowsocks + gRPC + TLS
+  # gRPC 传输将 SS 字节流承载于 HTTP/2 POST 帧，需配合 TLS（alpn 含 h2）。
+  - type: shadowsocks
+    tag: ss-grpc
+    server: your-ss-grpc-server.example.com
+    server_port: 443
+    method: aes-256-gcm
+    password: your-password
+    tls:
+      enabled: true
+      server_name: your-ss-grpc-server.example.com
+      insecure: false
+      alpn: [h2]
+      utls:
+        enabled: true
+        fingerprint: chrome
+    transport:
+      type: grpc
+      service_name: GunService
+      host: your-ss-grpc-server.example.com
+  - type: tuic
+    tag: proxy-tuic
+    server: your.domain.com
+    server_port: 443
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    password: your-password
+    congestion_control: bbr
+    udp_relay_mode: native
+    zero_rtt_handshake: false
+    heartbeat: "10s"
+    tls:
+      server_name: your.domain.com
+      alpn: [h3]
+      insecure: false
+  - type: hysteria2
+    tag: hy2-proxy
+    server: your-hy2-server.example.com
+    server_port: 443
+    password: your-password
+    tls:
+      enabled: true
+      server_name: your-hy2-server.example.com
+      insecure: false
+    up_mbps: 50
+    down_mbps: 200
+  - type: anytls
+    tag: anytls-proxy
+    server: your-anytls-server.example.com
+    server_port: 443
+    password: your-password
+    tls:
+      enabled: true
+      server_name: your-anytls-server.example.com
+      insecure: false
+    idle_session_check_interval: "30s"
+    idle_session_timeout: "60s"
+    min_idle_session: 0
+  # NaiveProxy 出站：基于 HTTP/2 CONNECT 隧道，承载于 TLS 之上。
+  # 协议参考：https://github.com/klzgrad/naiveproxy
+  # 字段与 sing-box option.NaiveOutboundOptions 完全对齐。
+  #
+  # 注意：sing-box 原生通过 cronet-go（Chrome 网络栈）实现，支持 HTTP/3 (QUIC)。
+  # 本实现使用 h2 crate，仅支持 HTTP/2 over TCP+TLS（启用 quic 会报错）。
+  # 字段 quic / quic_congestion_control / quic_session_receive_window 仅保留
+  # 以兼容 sing-box 配置语法，写入会被忽略或导致错误。
+  - type: naive
+    tag: naive-proxy
+    server: your-naive-server.example.com
+    server_port: 443
+    username: user
+    password: your-password
+    # 可选：不安全并发数（对应 sing-box InsecureConcurrency）。
+    # 大于 1 时 sing-box 会启用多个独立连接池轮询使用；本实现记录但不强制隔离。
+    insecure_concurrency: 0
+    # 可选：额外 HTTP 请求头（对应 sing-box ExtraHeaders）。
+    # sing-box 原始类型为 map[string][]string，此处取每个键的首个值。
+    # extra_headers:
+    #   X-Custom-Header: value
+    # 可选：HTTP/2 流接收窗口大小（对应 sing-box stream_receive_window）。
+    # 接受纯数字或带 K/M/G 后缀的字符串（如 64K、1M），0 = 使用 h2 默认值。
+    stream_receive_window: 0
+    # 可选：UDP over TCP（对应 sing-box udp_over_tcp）。
+    # 简写：true / false（version 默认 2，与 sing-box 一致）
+    # 完整：
+    #   udp_over_tcp:
+    #     enabled: true
+    #     version: 2
+    # 启用后 UDP 流量通过 TCP 隧道传输，否则 UDP 流量会被拒绝。
+    udp_over_tcp: true
+    # 可选：QUIC/HTTP3 模式（对应 sing-box QUIC）。本实现暂不支持，启用会报错。
+    quic: false
+    # 可选：QUIC 拥塞控制算法（对应 sing-box QUICCongestionControl）。
+    # 可选值：""（默认）、bbr、bbr2、cubic、reno。仅在 QUIC 模式下生效。
+    quic_congestion_control: ""
+    # 可选：QUIC 会话接收窗口大小（对应 sing-box quic_session_receive_window）。仅在 QUIC 模式下生效。
+    quic_session_receive_window: 0
+    # TLS 配置（NaiveProxy 必须启用 TLS，对应 sing-box OutboundTLSOptionsContainer.TLS）。
+    tls:
+      enabled: true
+      server_name: your-naive-server.example.com
+      insecure: false
+      # 可选：自定义 CA 证书（PEM 内容数组，对应 sing-box TLS.Certificate）。
+      # YAML 中多行字符串用 | 或 |- 块标量：
+      # certificate:
+      #   - |-
+      #     -----BEGIN CERTIFICATE-----
+      #     ...
+      #     -----END CERTIFICATE-----
+      # 可选：自定义 CA 证书文件路径（对应 sing-box TLS.CertificatePath）
+      # certificate_path: /etc/reflex/certs/naive.pem
+  - type: trojan
+    tag: trojan-proxy
+    server: your.domain.com
+    server_port: 443
+    password: your-password
+    tls:
+      enabled: true
+      server_name: your.domain.com
+      insecure: false
+  - type: trojan
+    tag: trojan-ws
+    server: your.domain.com
+    server_port: 443
+    password: your-password
+    transport:
+      type: ws
+      path: "/trojan"
+      headers:
+        Host: your.domain.com
+    tls:
+      enabled: true
+      server_name: your.domain.com
+      insecure: false
+  # Trojan + gRPC + TLS
+  # gRPC 传输将 Trojan 握手与数据流承载于 HTTP/2 帧，需配合 TLS（alpn 含 h2）。
+  - type: trojan
+    tag: trojan-grpc
+    server: your-trojan-grpc-server.example.com
+    server_port: 443
+    password: your-password
+    tls:
+      enabled: true
+      server_name: your-trojan-grpc-server.example.com
+      insecure: false
+      alpn: [h2]
+      utls:
+        enabled: true
+        fingerprint: chrome
+    transport:
+      type: grpc
+      service_name: GunService
+      host: your-trojan-grpc-server.example.com
+  # ShadowQuic 出站：0-RTT QUIC + JLS SNI 伪装，主动探测防御。
+  # 协议参考：https://github.com/salsa-energy/shadowquic
+  # 与 flux 服务端 `type = "shadowquic"` 节点对接。
+  #
+  # 关键概念：
+  #   server_name — JLS SNI 伪装域名，必须与服务端 jls_upstream 的域名一致
+  #                 （例如服务端 jls_upstream = "www.bing.com:443"，则此处填 "www.bing.com"）。
+  #   username/password — JLS 认证凭据，必须与服务端 users 中的某一项完全一致。
+  #   alpn — 默认 ["h3"]，必须与服务端有交集。
+  #
+  # 字段与 shadowquic crate `ShadowQuicClientCfg` 对齐：
+  - type: shadowquic
+    tag: shadowquic-proxy
+    server: your-shadowquic-server.example.com
+    server_port: 443
+    username: alice
+    password: your-password
+    server_name: www.bing.com
+    # 可选高级参数（以下均为默认值）：
+    # alpn: ["h3"]
+    # initial_mtu: 1300            # 初始 MTU，高丢包网络建议 1400
+    # min_mtu: 1290                # 最小 MTU（必须小于 initial_mtu）
+    # congestion_control: "bbr"    # 也支持 "cubic" | "new-reno" | "brutal"
+    # brutal_bandwidth: 10000000   # 仅 congestion_control="brutal" 时生效，单位 bps，默认 10 Mbps
+    # zero_rtt: true               # 启用 0-RTT 握手
+    # over_stream: false           # UDP over stream 模式（false=datagram 更高效）
+    # keep_alive_interval: 0       # Keep alive 间隔（毫秒），0=禁用，应 < 30000
+    # gso: true                    # 启用 QUIC GSO
+    # mtu_discovery: true          # 启用 MTU 自动发现
+    # blackhole_detection: false   # 启用 MTU 黑洞检测，高丢包网络建议关闭
+
+  # ── SSH 出站 ────────────────────────────────────────────────────────────
+  # 通过 SSH 隧道转发 TCP 流量（russh 实现），适用于受限网络环境下的回连。
+  # 协议参考：clash-rs SSH outbound（https://github.com/Watfaq/clash-rs）
+  #
+  # 认证方式（按顺序尝试）：
+  #   1. publickey — 加载 private_key 指向的 PEM 文件（支持 ~ 展开）
+  #   2. password  — 密码登录
+  #   3. keyboard-interactive — 配合 TOTP 2FA 使用
+  #
+  # 注意：
+  # - SSH 出站**不支持 UDP 转发**（与 clash-rs 行为一致）
+  # - host_key 留空时跳过服务端公钥校验（不安全，仅调试用）
+  # - TOTP 用于键盘交互认证中的 "Verification code:" 提示
+  - type: ssh
+    tag: ssh-proxy
+    server: your-ssh-server.example.com
+    server_port: 22
+    username: root
+    # password: your-password           # 可选：配合键盘交互或单独使用
+    # private_key: "~/.ssh/id_ed25519"  # 可选：私钥文件路径或内联 PEM 内容
+    # private_key_passphrase: ""        # 可选：加密私钥的保护密码
+    # host_key:                         # 可选：期望的服务端公钥（OpenSSH 格式）
+    #   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+    # host_key_algorithms:              # 可选：限制 host key 算法
+    #   - "ssh-ed25519"
+    #   - "rsa-sha2-256"
+    # totp_opt:                         # 可选：TOTP 2FA 配置
+    #   # 写法一：otpauth URL
+    #   type: otp-auth
+    #   secret: "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&period=30"
+    #   # 写法二：显式字段
+    #   # type: common
+    #   # secret: "JBSWY3DPEHPK3PXP"
+    #   # step: 30
+    #   # digits: 6
+    #   # algorithm: "sha1"
+
+  # ── Tailscale 出站 ──────────────────────────────────────────────────────
+  # 通过 Tailscale userspace netstack 转发流量到 tailnet 内的节点或
+  # 经由 subnet router 可达的内部服务。
+  # 协议参考：clash-rs Tailscale outbound（tailscale-rs crate）
+  #
+  # 注意：
+  # - **不暴露 exit-node 选择**（与 clash-rs 一致）：用户应通过 Tailscale
+  #   控制台配置 subnet router，并把目标 IP 设为该 subnet 内的地址。
+  # - 首次使用需提供 auth_key 完成加入 tailnet；之后状态会写入 state_dir。
+  # - ephemeral=true 时每次启动都是新身份，忽略 state_dir。
+  # - state_dir 留空时使用内存状态，进程退出即丢失身份。
+  # - 自托管 Headscale 时把 control_url 改为 Headscale 地址。
+  - type: tailscale
+    tag: tailscale-proxy
+    auth_key: "tskey-auth-XXXXXXXXXXXXXXXXXXXX"   # 从 https://login.tailscale.com/admin/settings/keys 生成
+    hostname: reflex-node                          # 在 tailnet 中显示的主机名
+    state_dir: "/var/lib/reflex/tailscale"         # 状态文件目录
+    # control_url: "https://controlplane.tailscale.com"  # 自托管 Headscale 时覆盖
+    # client_name: reflex           # 控制台展示用，默认 "reflex"
+    # ephemeral: false              # true 时退出 tailnet 后自动清理
+
+  - type: wire-guard
+    tag: wg-out
+    address:
+      - "10.0.0.2/32"
+      - "fd00::2/128"
+    private_key: YOUR_PRIVATE_KEY_BASE64
+    peers:
+      - address: wg.example.com
+        port: 51820
+        public_key: PEER_PUBLIC_KEY_BASE64
+        pre_shared_key: ""
+        allowed_ips:
+          - "0.0.0.0/0"
+          - "::/0"
+        reserved: []
+    mtu: 1408
+  - type: direct
+    tag: direct
+    # network_strategy: happy_eyeballs 启用 RFC 8305 风格的多候选地址
+    #   并发拨号：域名同时有 A/AAAA 记录时，错峰尝试多个候选，谁先连上用谁，
+    #   可缓解双栈网络下因某个协议栈故障/丢包造成的连接延迟。
+    #   对齐 sing-box network_strategy。
+    # fallback_delay_ms: 启动下一个候选前的等待毫秒数，默认 250（RFC 8305 推荐值）。
+    # network_strategy: happy_eyeballs
+    # fallback_delay_ms: 250
+  - type: block
+    tag: block
+    # method: drop 时静默丢弃——不关闭连接也不回任何数据，连接会一直挂着
+    #   直到客户端自己放弃。比默认立即关闭更难被探测区分"被拒绝"和
+    #   "网络不通"。对齐 sing-box reject 动作的 method 字段
+    #   （不填或 default 为立即关闭，即原有行为）。
+    # method: drop
+
+# ── 日志配置 ─────────────────────────────────────────────────────────────
+log:
+  level: info
+  output: stderr
+  timestamp: true

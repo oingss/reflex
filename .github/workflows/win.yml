@@ -1,0 +1,83 @@
+name: test win
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. 交叉编译 reflex ────────────────────────────────────────────────────
+  build:
+    name: Build / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:   x86_64-pc-windows-msvc
+            os:       windows-latest
+            artifact: reflex-windows-x86_64
+            cross:    false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+
+      - name: Update Cargo.lock to match new version
+        shell: bash
+        run: cargo update --workspace
+
+      - name: Build reflex (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --bin reflex \
+            --no-default-features
+
+      - name: Collect binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/reflex.exe"
+          cp "$BIN" "${{ matrix.artifact }}.exe"
+          certutil -hashfile "${{ matrix.artifact }}.exe" SHA256 \
+            | grep -v "hash" | grep -v "CertUtil" \
+            > "${{ matrix.artifact }}.exe.sha256"
+          echo "=== Build output ==="
+          ls -lh "${{ matrix.artifact }}.exe"
+          cat    "${{ matrix.artifact }}.exe.sha256"
+
+      - name: Create GitHub Release
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   test
+          name:       "reflex test"
+          prerelease: false
+          files:      |
+            ${{ matrix.artifact }}.exe
