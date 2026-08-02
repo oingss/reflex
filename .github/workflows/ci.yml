@@ -1,4 +1,4 @@
-name: test
+name: ci
 
 on:
   workflow_dispatch:
@@ -99,8 +99,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: test
-          name: "reflex test"
+          tag_name: ci
+          name: "reflex ci"
           prerelease: false
           files: |
             dist/${{ env.BIN_NAME }}
