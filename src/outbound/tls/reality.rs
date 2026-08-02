@@ -10,8 +10,9 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes128Gcm, Aes256Gcm, Nonce, Tag,
 };
+use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
@@ -21,6 +22,7 @@ use tracing::{debug, warn};
 use crate::config::outbound::RealityDialConfig;
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha384 = Hmac<Sha384>;
 type HmacSha512 = Hmac<Sha512>;
 
 const TLS_RECORD_HANDSHAKE: u8 = 22;
@@ -37,6 +39,8 @@ const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
 
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 const GROUP_X25519: u16 = 0x001d;
 
@@ -454,7 +458,7 @@ async fn reality_handshake(
             }
             HS_FINISHED => {
                 server_finished = msg.raw;
-                verify_finished(&hs.server_secret, &transcript, &msg.body)?;
+                verify_finished(cipher.hash_kind(), &hs.server_secret, &transcript, &msg.body)?;
                 debug!("REALITY: server Finished verified");
                 break;
             }
@@ -477,7 +481,7 @@ async fn reality_handshake(
     transcript.extend_from_slice(&server_finished);
     let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
 
-    let client_finished_body = finished_verify_data(&hs.client_secret, &transcript);
+    let client_finished_body = cipher.hash_kind().finished_verify_data(&hs.client_secret, &transcript);
     let mut client_finished = Vec::with_capacity(4 + client_finished_body.len());
     client_finished.push(HS_FINISHED);
     put_u24(client_finished_body.len(), &mut client_finished);
@@ -533,7 +537,15 @@ fn build_reality_client_hello(
     body.push(32); // session_id_len
     body.extend_from_slice(&[0u8; 32]); // session_id placeholder（全零，后续加密后填入）
 
-    let ciphers = [TLS_AES_128_GCM_SHA256];
+    // 广播全部三种 TLS 1.3 cipher suite，与 Chrome uTLS 指纹一致。
+    // 旧实现只广播 TLS_AES_128_GCM_SHA256，导致：
+    // 1) 服务端若偏好 AES_256_GCM/ChaCha20 会 handshake_failure
+    // 2) ClientHello cipher 列表只有 1 项，与真实浏览器差异大，易被 DPI 识别
+    let ciphers = [
+        TLS_AES_128_GCM_SHA256,
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+    ];
     put_u16((ciphers.len() * 2) as u16, &mut body);
     for cipher in ciphers {
         put_u16(cipher, &mut body);
@@ -584,9 +596,11 @@ fn build_reality_client_hello(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock before UNIX_EPOCH: {e}"))?
         .as_secs() as u32;
-    reality_plain[0] = 1; // version 1.8.2
+    // 与 sing-box reality_client.go:186-188 完全对齐：版本 1.8.1。
+    // 旧实现使用 1.8.2，服务端配置了 maxClientVer=1.8.1 时会被拒绝。
+    reality_plain[0] = 1; // version 1.8.1
     reality_plain[1] = 8;
-    reality_plain[2] = 2;
+    reality_plain[2] = 1;
     reality_plain[3] = 0;
     reality_plain[4..8].copy_from_slice(&unix.to_be_bytes());
     reality_plain[8..16].copy_from_slice(short_id);
@@ -745,7 +759,30 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
                 return Ok(());
             }
             TLS_RECORD_ALERT => {
-                anyhow::bail!("REALITY: server alert");
+                // 与明文阶段的 alert 日志（read_plain_handshake 中）对齐：
+                // 解密后的 alert 明文为 [level(1B), description(1B)]（RFC 8446 §6）。
+                // 旧实现只 bail 一句 "server alert"，丢失了诊断 REALITY 失败原因的
+                // 关键信息（如 handshake_failure=70 表示 REALITY 验证未通过、
+                // certificate_revoked=44 表示证书被吊销等）。
+                if plaintext.len() >= 2 {
+                    warn!(
+                        alert_level = plaintext[0],
+                        alert_desc = plaintext[1],
+                        "REALITY: server sent encrypted TLS Alert during handshake \
+                         (verification likely failed)"
+                    );
+                    anyhow::bail!(
+                        "REALITY: server alert (level={}, desc={})",
+                        plaintext[0],
+                        plaintext[1]
+                    );
+                } else {
+                    warn!(
+                        alert_len = plaintext.len(),
+                        "REALITY: server sent truncated encrypted TLS Alert"
+                    );
+                    anyhow::bail!("REALITY: server alert (truncated)");
+                }
             }
             _ => {}
         }
@@ -986,15 +1023,22 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
 
 // ── TLS 1.3 密钥派生 ─────────────────────────────────────────────────────────
 
+/// TLS 1.3 cipher suite：支持全部三种 RFC 8446 4.2.11 定义的套件。
+/// 旧实现仅支持 TLS_AES_128_GCM_SHA256，服务端若选择 AES_256_GCM 或
+/// ChaCha20-Poly1305（在有/无 AES-NI 的服务器上均常见）会直接失败。
 #[derive(Clone, Copy)]
 enum CipherSuite {
     Aes128GcmSha256,
+    Aes256GcmSha384,
+    ChaCha20Poly1305Sha256,
 }
 
 impl CipherSuite {
     fn try_from(value: u16) -> anyhow::Result<Self> {
         match value {
             TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
+            TLS_AES_256_GCM_SHA384 => Ok(Self::Aes256GcmSha384),
+            TLS_CHACHA20_POLY1305_SHA256 => Ok(Self::ChaCha20Poly1305Sha256),
             other => anyhow::bail!("REALITY: unsupported cipher suite 0x{other:04x}"),
         }
     }
@@ -1002,6 +1046,124 @@ impl CipherSuite {
     fn key_len(self) -> usize {
         match self {
             Self::Aes128GcmSha256 => 16,
+            Self::Aes256GcmSha384 | Self::ChaCha20Poly1305Sha256 => 32,
+        }
+    }
+
+    fn hash_kind(self) -> HashKind {
+        match self {
+            Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => HashKind::Sha256,
+            Self::Aes256GcmSha384 => HashKind::Sha384,
+        }
+    }
+}
+
+/// 哈希算法抽象：TLS 1.3 key schedule 的 HKDF hash 由 cipher suite 决定。
+/// - SHA-256 用于 TLS_AES_128_GCM_SHA256 / TLS_CHACHA20_POLY1305_SHA256
+/// - SHA-384 用于 TLS_AES_256_GCM_SHA384
+#[derive(Clone, Copy)]
+enum HashKind {
+    Sha256,
+    Sha384,
+}
+
+impl HashKind {
+    fn output_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
+        }
+    }
+
+    fn hkdf_extract(self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => {
+                let mut h =
+                    <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+                h.update(ikm);
+                h.finalize().into_bytes().to_vec()
+            }
+            Self::Sha384 => {
+                let mut h =
+                    <HmacSha384 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+                h.update(ikm);
+                h.finalize().into_bytes().to_vec()
+            }
+        }
+    }
+
+    fn hkdf_expand(self, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+        let mut okm = Vec::with_capacity(len);
+        let mut previous = Vec::new();
+        let mut counter = 1u8;
+        while okm.len() < len {
+            match self {
+                Self::Sha256 => {
+                    let mut h = <HmacSha256 as Mac>::new_from_slice(prk)
+                        .expect("HMAC accepts any key length");
+                    h.update(&previous);
+                    h.update(info);
+                    h.update(&[counter]);
+                    previous = h.finalize().into_bytes().to_vec();
+                }
+                Self::Sha384 => {
+                    let mut h = <HmacSha384 as Mac>::new_from_slice(prk)
+                        .expect("HMAC accepts any key length");
+                    h.update(&previous);
+                    h.update(info);
+                    h.update(&[counter]);
+                    previous = h.finalize().into_bytes().to_vec();
+                }
+            }
+            okm.extend_from_slice(&previous);
+            counter = counter.checked_add(1).expect("HKDF output too long");
+        }
+        okm.truncate(len);
+        okm
+    }
+
+    fn hkdf_expand_label(
+        self,
+        secret: &[u8],
+        label: &[u8],
+        context: &[u8],
+        len: usize,
+    ) -> Vec<u8> {
+        let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
+        put_u16(len as u16, &mut info);
+        info.push((6 + label.len()) as u8);
+        info.extend_from_slice(b"tls13 ");
+        info.extend_from_slice(label);
+        info.push(context.len() as u8);
+        info.extend_from_slice(context);
+        self.hkdf_expand(secret, &info, len)
+    }
+
+    fn derive_secret(self, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+        self.hkdf_expand_label(secret, label, transcript_hash, self.output_len())
+    }
+
+    fn finished_verify_data(self, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+        let finished_key = self.hkdf_expand_label(secret, b"finished", &[], self.output_len());
+        let transcript_hash = self.digest(transcript);
+        match self {
+            Self::Sha256 => {
+                let mut h = <HmacSha256 as Mac>::new_from_slice(&finished_key).expect("HMAC key");
+                h.update(&transcript_hash);
+                h.finalize().into_bytes().to_vec()
+            }
+            Self::Sha384 => {
+                let mut h = <HmacSha384 as Mac>::new_from_slice(&finished_key).expect("HMAC key");
+                h.update(&transcript_hash);
+                h.finalize().into_bytes().to_vec()
+            }
         }
     }
 }
@@ -1009,23 +1171,25 @@ impl CipherSuite {
 struct HandshakeKeys {
     client: RecordKey,
     server: RecordKey,
-    client_secret: [u8; 32],
-    server_secret: [u8; 32],
-    master_secret: [u8; 32],
+    client_secret: Vec<u8>,
+    server_secret: Vec<u8>,
+    master_secret: Vec<u8>,
 }
 
 impl HandshakeKeys {
     fn derive(cipher: CipherSuite, shared_secret: &[u8; 32], transcript: &[u8]) -> Self {
-        let zero = [0u8; 32];
-        let empty_hash = Sha256::digest([]);
-        let early_secret = hkdf_extract(&zero, &zero);
-        let derived = derive_secret(&early_secret, b"derived", &empty_hash);
-        let handshake_secret = hkdf_extract(&derived, shared_secret);
-        let transcript_hash = Sha256::digest(transcript);
-        let client_secret = derive_secret(&handshake_secret, b"c hs traffic", &transcript_hash);
-        let server_secret = derive_secret(&handshake_secret, b"s hs traffic", &transcript_hash);
-        let derived = derive_secret(&handshake_secret, b"derived", &empty_hash);
-        let master_secret = hkdf_extract(&derived, &zero);
+        let hash = cipher.hash_kind();
+        let hash_len = hash.output_len();
+        let zero = vec![0u8; hash_len];
+        let empty_hash = hash.digest(&[]);
+        let early_secret = hash.hkdf_extract(&zero, &zero);
+        let derived = hash.derive_secret(&early_secret, b"derived", &empty_hash);
+        let handshake_secret = hash.hkdf_extract(&derived, shared_secret);
+        let transcript_hash = hash.digest(transcript);
+        let client_secret = hash.derive_secret(&handshake_secret, b"c hs traffic", &transcript_hash);
+        let server_secret = hash.derive_secret(&handshake_secret, b"s hs traffic", &transcript_hash);
+        let derived = hash.derive_secret(&handshake_secret, b"derived", &empty_hash);
+        let master_secret = hash.hkdf_extract(&derived, &zero);
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1042,10 +1206,11 @@ struct ApplicationKeys {
 }
 
 impl ApplicationKeys {
-    fn derive(cipher: CipherSuite, master_secret: &[u8; 32], transcript: &[u8]) -> Self {
-        let transcript_hash = Sha256::digest(transcript);
-        let client_secret = derive_secret(master_secret, b"c ap traffic", &transcript_hash);
-        let server_secret = derive_secret(master_secret, b"s ap traffic", &transcript_hash);
+    fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
+        let hash = cipher.hash_kind();
+        let transcript_hash = hash.digest(transcript);
+        let client_secret = hash.derive_secret(master_secret, b"c ap traffic", &transcript_hash);
+        let server_secret = hash.derive_secret(master_secret, b"s ap traffic", &transcript_hash);
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1055,6 +1220,8 @@ impl ApplicationKeys {
 
 enum AeadCipher {
     Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
+    ChaCha20(Box<ChaCha20Poly1305>),
 }
 
 struct RecordKey {
@@ -1064,14 +1231,21 @@ struct RecordKey {
 }
 
 impl RecordKey {
-    fn new(cipher_suite: CipherSuite, secret: &[u8; 32]) -> Self {
-        let key = hkdf_expand_label(secret, b"key", &[], cipher_suite.key_len());
-        let iv = hkdf_expand_label(secret, b"iv", &[], 12);
+    fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
+        let hash = cipher_suite.hash_kind();
+        let key = hash.hkdf_expand_label(secret, b"key", &[], cipher_suite.key_len());
+        let iv = hash.hkdf_expand_label(secret, b"iv", &[], 12);
         let mut iv_arr = [0u8; 12];
         iv_arr.copy_from_slice(&iv);
         let cipher = match cipher_suite {
             CipherSuite::Aes128GcmSha256 => AeadCipher::Aes128(Box::new(
                 Aes128Gcm::new_from_slice(&key).expect("AES-128 key"),
+            )),
+            CipherSuite::Aes256GcmSha384 => AeadCipher::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).expect("AES-256 key"),
+            )),
+            CipherSuite::ChaCha20Poly1305Sha256 => AeadCipher::ChaCha20(Box::new(
+                ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20 key"),
             )),
         };
         Self {
@@ -1137,6 +1311,12 @@ impl RecordKey {
             AeadCipher::Aes128(c) => c
                 .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, body)
                 .map_err(|e| anyhow::anyhow!("TLS AES-128-GCM encrypt: {e}")),
+            AeadCipher::Aes256(c) => c
+                .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, body)
+                .map_err(|e| anyhow::anyhow!("TLS AES-256-GCM encrypt: {e}")),
+            AeadCipher::ChaCha20(c) => c
+                .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, body)
+                .map_err(|e| anyhow::anyhow!("TLS ChaCha20-Poly1305 encrypt: {e}")),
         }
     }
 
@@ -1151,12 +1331,23 @@ impl RecordKey {
             AeadCipher::Aes128(c) => c
                 .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, body, tag)
                 .map_err(|e| anyhow::anyhow!("TLS AES-128-GCM decrypt: {e}")),
+            AeadCipher::Aes256(c) => c
+                .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, body, tag)
+                .map_err(|e| anyhow::anyhow!("TLS AES-256-GCM decrypt: {e}")),
+            AeadCipher::ChaCha20(c) => c
+                .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, body, tag)
+                .map_err(|e| anyhow::anyhow!("TLS ChaCha20-Poly1305 decrypt: {e}")),
         }
     }
 }
 
-fn verify_finished(secret: &[u8; 32], transcript: &[u8], received: &[u8]) -> anyhow::Result<()> {
-    let expected = finished_verify_data(secret, transcript);
+fn verify_finished(
+    hash: HashKind,
+    secret: &[u8],
+    transcript: &[u8],
+    received: &[u8],
+) -> anyhow::Result<()> {
+    let expected = hash.finished_verify_data(secret, transcript);
     if expected.as_slice() == received {
         Ok(())
     } else {
@@ -1164,51 +1355,21 @@ fn verify_finished(secret: &[u8; 32], transcript: &[u8], received: &[u8]) -> any
     }
 }
 
-fn finished_verify_data(secret: &[u8; 32], transcript: &[u8]) -> Vec<u8> {
-    let finished_key = hkdf_expand_label(secret, b"finished", &[], 32);
-    let transcript_hash = Sha256::digest(transcript);
-    let mut h = <HmacSha256 as Mac>::new_from_slice(&finished_key).expect("HMAC key");
-    h.update(&transcript_hash);
-    h.finalize().into_bytes().to_vec()
-}
-
-fn derive_secret(secret: &[u8; 32], label: &[u8], transcript_hash: &[u8]) -> [u8; 32] {
-    let expanded = hkdf_expand_label(secret, label, transcript_hash, 32);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&expanded);
-    out
-}
-
-fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
-    let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
-    put_u16(len as u16, &mut info);
-    info.push((6 + label.len()) as u8);
-    info.extend_from_slice(b"tls13 ");
-    info.extend_from_slice(label);
-    info.push(context.len() as u8);
-    info.extend_from_slice(context);
-    hkdf_expand(secret, &info, len)
-}
-
+/// REALITY 认证密钥派生（HKDF-SHA256）。始终使用 SHA-256，与 cipher suite 无关。
+/// 参考：reality-main/tls.go:178, sing-box reality_client.go:214。
 fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-    let prk = hkdf_extract(salt, secret);
-    hkdf_expand(&prk, info, len)
-}
-
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let mut h = <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
-    h.update(ikm);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize().into_bytes());
-    out
-}
-
-fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let prk = {
+        let mut h =
+            <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+        h.update(secret);
+        h.finalize().into_bytes().to_vec()
+    };
     let mut okm = Vec::with_capacity(len);
     let mut previous = Vec::new();
     let mut counter = 1u8;
     while okm.len() < len {
-        let mut h = <HmacSha256 as Mac>::new_from_slice(prk).expect("HMAC accepts any key length");
+        let mut h =
+            <HmacSha256 as Mac>::new_from_slice(&prk).expect("HMAC accepts any key length");
         h.update(&previous);
         h.update(info);
         h.update(&[counter]);
@@ -1354,7 +1515,7 @@ mod tests {
             .decrypt_in_place_detached(nonce, &aad, &mut buf, Tag::from_slice(tag))
             .expect("session_id must decrypt under the server-derived key");
 
-        assert_eq!(&buf[0..4], &[1, 8, 2, 0], "reality auth header");
+        assert_eq!(&buf[0..4], &[1, 8, 1, 0], "reality auth header");
         assert_eq!(&buf[8..16], &short_id, "short_id echoed");
     }
 
