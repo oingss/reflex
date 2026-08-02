@@ -2,6 +2,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -10,6 +11,7 @@ use pin_project_lite::pin_project;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
+    time::timeout,
 };
 use tokio_tungstenite::{
     client_async_with_config,
@@ -19,6 +21,15 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 use tracing::debug;
+
+/// WS 握手（含 TLS 握手）超时，与 sing-box `constant.TCPTimeout`（15s）对齐。
+///
+/// sing-box `v2raywebsocket/client.go:87` 在 dial 完成后对底层 conn 设置
+/// `SetDeadline(now + TCPTimeout)`，覆盖 TLS 握手 + WS Upgrade 全过程，
+/// 完成后重置为零值。旧 reflex 实现没有任何超时，服务端若 accept TCP 后
+/// 不响应 HTTP Upgrade（恶意/误配置），`client_async_with_config` 会无限期挂起，
+/// 占用连接资源。
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 use crate::config::outbound::{TlsConfig, WsTransportConfig};
 use crate::dns::DnsResolver;
@@ -95,37 +106,58 @@ pub async fn connect(
         );
     }
 
-    // 构建底层 I/O 流：TLS 启用时先建立 TLS 流（支持 uTLS），否则用明文 TCP。
-    // 与 sing-box 一致：WS 握手在已建立的 TLS 流上进行，TLS 配置由
-    // `connect_tls_or_utls` 统一处理（含 uTLS 指纹、自签证书、ALPN）。
-    let io: Box<dyn AsyncReadWrite> = if tls_enabled {
-        // WS over TLS 必须使用 http/1.1 ALPN（RFC 6455 要求 HTTP Upgrade）。
-        // 若 ALPN 协商出 h2，WS 握手会失败（tokio-tungstenite 的 client_async
-        // 走 HTTP/1.1 Upgrade，不支持 h2）。
-        //
-        // 旧实现仅在 alpn 为空时回填 http/1.1，导致用户配置 ["h2","http/1.1"]
-        // 时服务端可能协商出 h2 → WS 握手失败。
-        // 修正：WS 强制 ALPN 为 http/1.1，覆盖用户配置的 h2。
-        let mut tls_cfg = tls.cloned().expect("tls is Some when tls_enabled");
-        tls_cfg.alpn = vec!["http/1.1".to_string()];
-        let tls_stream = crate::outbound::tls::connect_tls_or_utls(tcp, sni, &tls_cfg).await?;
-        Box::new(tls_stream)
-    } else {
-        Box::new(tcp)
-    };
-
-    // 在已建立的流（TLS 或 TCP）上进行 WS 握手，不再依赖 tokio-tungstenite
-    // 内置的 TLS connector，从而保证 TLS 配置走统一入口。
-    //
-    // write_buffer_size=0：每次 write 即刻将帧写入底层流，不再缓冲到 128KB。
-    // 与 sing-box v2raywebsocket/conn.go Write() 每次各自成帧、立即发送一致。
-    // 虽然 relay() 在每次 write_all 后调用 flush，但 write_buffer_size=0 可确保
-    // 即使 flush 延迟（如 tokio::io::split 锁竞争），帧也能尽早到达服务端。
+    // 构建 WS 握手配置（write_buffer_size=0 见下方说明）。
     let ws_config = WebSocketConfig {
         write_buffer_size: 0,
         ..Default::default()
     };
-    let (ws_stream, _) = client_async_with_config(request, io, Some(ws_config)).await?;
+
+    // 用 timeout 包裹 TLS 握手 + WS Upgrade 全过程，与 sing-box
+    // `v2raywebsocket/client.go:87` 的 `SetDeadline(now + TCPTimeout)` 对齐。
+    //
+    // sing-box 在 dial 后对 conn 设 15s deadline，覆盖 TLS 握手 + WS Upgrade，
+    // 完成后重置为零值。tokio 没有 set_deadline on TcpStream 后再传给 TLS 的
+    // 简洁写法（TLS 流拥有 TCP 所有权），故用 `tokio::time::timeout` 包裹整个
+    // handshake future。超时时 future 被 drop，底层 TCP/TLS 流随之关闭。
+    let (ws_stream, _) = timeout(WS_HANDSHAKE_TIMEOUT, async {
+        // 构建底层 I/O 流：TLS 启用时先建立 TLS 流（支持 uTLS），否则用明文 TCP。
+        // 与 sing-box 一致：WS 握手在已建立的 TLS 流上进行，TLS 配置由
+        // `connect_tls_or_utls` 统一处理（含 uTLS 指纹、自签证书、ALPN）。
+        let io: Box<dyn AsyncReadWrite> = if tls_enabled {
+            // WS over TLS 必须使用 http/1.1 ALPN（RFC 6455 要求 HTTP Upgrade）。
+            // 若 ALPN 协商出 h2，WS 握手会失败（tokio-tungstenite 的 client_async
+            // 走 HTTP/1.1 Upgrade，不支持 h2）。
+            //
+            // 旧实现仅在 alpn 为空时回填 http/1.1，导致用户配置 ["h2","http/1.1"]
+            // 时服务端可能协商出 h2 → WS 握手失败。
+            // 修正：WS 强制 ALPN 为 http/1.1，覆盖用户配置的 h2。
+            let mut tls_cfg = tls.cloned().expect("tls is Some when tls_enabled");
+            tls_cfg.alpn = vec!["http/1.1".to_string()];
+            let tls_stream = crate::outbound::tls::connect_tls_or_utls(tcp, sni, &tls_cfg).await?;
+            Box::new(tls_stream) as Box<dyn AsyncReadWrite>
+        } else {
+            Box::new(tcp) as Box<dyn AsyncReadWrite>
+        };
+
+        // 在已建立的流（TLS 或 TCP）上进行 WS 握手，不再依赖 tokio-tungstenite
+        // 内置的 TLS connector，从而保证 TLS 配置走统一入口。
+        //
+        // write_buffer_size=0：每次 write 即刻将帧写入底层流，不再缓冲到 128KB。
+        // 与 sing-box v2raywebsocket/conn.go Write() 每次各自成帧、立即发送一致。
+        // 虽然 relay() 在每次 write_all 后调用 flush，但 write_buffer_size=0 可确保
+        // 即使 flush 延迟（如 tokio::io::split 锁竞争），帧也能尽早到达服务端。
+        client_async_with_config(request, io, Some(ws_config))
+            .await
+            .map_err(|e| anyhow::anyhow!("WS upgrade: {e}"))
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "WS handshake timed out after {}s (TLS+WS Upgrade) for {server}:{port}",
+            WS_HANDSHAKE_TIMEOUT.as_secs()
+        )
+    })??;
+
     debug!(%server, port, tls_enabled, "websocket connected");
     Ok(ws_stream)
 }
