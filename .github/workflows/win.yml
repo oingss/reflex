@@ -1,4 +1,4 @@
-name: test win
+name: win ci
 
 on:
   workflow_dispatch:
@@ -76,8 +76,8 @@ jobs:
         if: runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name:   test
-          name:       "reflex test"
+          tag_name:   win-ci
+          name:       "reflex ci"
           prerelease: false
           files:      |
             ${{ matrix.artifact }}.exe
