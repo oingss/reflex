@@ -15,7 +15,7 @@ env:
 
 jobs:
   test-and-build:
-    name: Test & Build
+    name: ci
     runs-on: ubuntu-latest
     permissions:
       contents: write
