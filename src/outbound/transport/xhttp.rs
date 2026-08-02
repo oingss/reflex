@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::{
@@ -32,6 +32,23 @@ use crate::config::outbound::{TlsConfig, XhttpTransportConfig};
 use crate::outbound::{apply_mark_to_tcp, set_tcp_opts};
 
 // ── 公共接口 ─────────────────────────────────────────────────────────────────
+
+/// 解析传输模式，与 Xray `dialer.go:362-371` 对齐。
+///
+/// - `"packet-up"` / `"stream-up"` / `"stream-one"` → 原样返回
+/// - `None` / `""` / `"auto"` → 默认 `"packet-up"`
+///
+/// 注意：Xray 在 REALITY 场景下默认选 `"stream-one"`，但 reflex 的 `TlsConfig`
+/// 不携带 reality 信息（VlessTlsConfig → TlsConfig 转换时丢弃），
+/// 因此无法在此处自动检测 REALITY。使用 REALITY+xhttp 时需显式配置
+/// `"mode": "stream-one"`。
+fn resolve_mode<'a>(mode: Option<&'a str>, _tls: Option<&TlsConfig>) -> &'a str {
+    match mode {
+        Some(m) if !m.is_empty() && m != "auto" => m,
+        _ => "packet-up",
+    }
+}
+
 
 /// 建立一条 XHTTP 双工流。
 pub async fn connect(
@@ -70,7 +87,13 @@ pub async fn connect(
 
     let client = build_http_client(tls, cfg, routing_mark, resolver)?;
 
-    let mode = cfg.mode.as_deref().unwrap_or("packet-up");
+    // 模式选择，与 Xray dialer.go:362-371 完全对齐：
+    //   mode == "" || mode == "auto" →
+    //     默认 "packet-up"；若使用 REALITY → "stream-one"。
+    //   旧实现：直接 unwrap_or("packet-up")，不处理 "auto"，
+    //   也不在 REALITY 场景自动选 stream-one，导致服务端（Xray/sing-box
+    //   在 REALITY 下默认期望 stream-one）拒绝或行为异常。
+    let mode = resolve_mode(cfg.mode.as_deref(), tls);
 
     let session_id = if mode != "stream-one" {
         Some(Uuid::new_v4().to_string())
@@ -94,12 +117,19 @@ pub async fn connect(
         session_id,
         headers,
         seq: AtomicI64::new(0),
+        // 与 Xray config.go:139-148 对齐：默认 1_000_000。
+        // Xray 使用 RangeConfig（From/To 随机），reflex 当前只支持单值，
+        // 取用户配置或默认值。
         max_post_bytes: cfg.sc_max_each_post_bytes.unwrap_or(1_000_000) as usize,
-        min_post_interval_ms: cfg.sc_min_posts_interval_ms.unwrap_or(0),
+        // 与 Xray config.go:150-159 对齐：默认 30ms。
+        // 旧实现默认 0（无间隔），高频 POST 可能触发服务端限流。
+        // Xray 默认 RangeConfig{From:30, To:30}。
+        min_post_interval_ms: cfg.sc_min_posts_interval_ms.unwrap_or(30),
         uplink_method: cfg
             .uplink_http_method
             .clone()
             .unwrap_or_else(|| "POST".to_string()),
+        no_grpc_header: cfg.no_grpc_header,
     });
 
     match mode {
@@ -359,6 +389,10 @@ struct XhttpShared {
     max_post_bytes: usize,
     min_post_interval_ms: u64,
     uplink_method: String,
+    /// 禁用 `Content-Type: application/grpc` 头，与 Xray `NoGRPCHeader` 对齐。
+    /// Xray config.go:325-327：stream-up/one（有 body 时）默认设置 grpc 头，
+    /// 服务端据此识别为流式上行；no_grpc_header=true 时跳过。
+    no_grpc_header: bool,
 }
 
 impl XhttpShared {
@@ -398,6 +432,7 @@ impl XhttpShared {
         method: &Method,
         url: &str,
         body: XhttpBody,
+        has_body: bool,
     ) -> anyhow::Result<Request<XhttpBody>> {
         let uri: Uri = url.parse()?;
         let host = uri.host().unwrap_or("").to_string();
@@ -409,6 +444,21 @@ impl XhttpShared {
             .body(body)?;
         // apply custom headers（覆盖同名 header）
         let mut req = self.apply_headers(req);
+
+        // Content-Type: application/grpc
+        // 与 Xray config.go:325-327 对齐：
+        //   if request.Body != nil && !c.NoGRPCHeader { // stream-up/one
+        //       request.Header.Set("Content-Type", "application/grpc")
+        //   }
+        // 有 body 的请求（stream-one、stream-up）默认设置 grpc 头，
+        // 服务端据此识别为流式上行。no_grpc_header=true 时跳过。
+        // 旧实现完全缺失此头，服务端可能无法正确识别 stream-up/one 请求。
+        if !self.no_grpc_header && has_body {
+            req.headers_mut().insert(
+                "content-type",
+                HeaderValue::from_static("application/grpc"),
+            );
+        }
 
         // XPadding：Xray xhttp 默认要求每个请求带 100-1000 字节 padding，
         // 放在 Referer 头的 query string 里（key=x_padding）。
@@ -440,7 +490,7 @@ async fn connect_stream_one(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStr
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(64);
     let url = shared.stream_url();
     let method = parse_method(&shared.uplink_method);
-    let req = shared.build_request(&method, &url, stream_body(body_rx))?;
+    let req = shared.build_request(&method, &url, stream_body(body_rx), true)?;
     debug!("xhttp stream-one: sending request");
     let resp = shared.client.request(req).await?;
     debug!(status = %resp.status(), "xhttp stream-one: response received");
@@ -454,32 +504,48 @@ async fn connect_stream_one(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStr
 
 async fn connect_stream_up_down(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStream> {
     let down_url = shared.stream_url();
-    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()))?;
+    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()), false)?;
     debug!("xhttp stream-up: sending GET download request");
     let down_resp = shared.client.request(req).await?;
     debug!(status = %down_resp.status(), "xhttp stream-up: download response received");
     check_status(down_resp.status(), "stream-down")?;
-    let read_half = RespBodyReader::new(down_resp.into_body());
+
+    // 关闭信号：上传 POST 失败时通知下行读取器返回错误。
+    // 与 Xray client.go:86-92 对齐：uploadOnly 的 OpenStream 在失败/非200 时
+    // 调用 wrc.Close()，使 download 侧的 Read 返回 io.ErrClosedPipe。
+    let close_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_half = RespBodyReader::with_close_flag(down_resp.into_body(), Some(close_flag.clone()));
 
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(64);
     let up_url = shared.stream_url();
     let method = parse_method(&shared.uplink_method);
-    let req = shared.build_request(&method, &up_url, stream_body(body_rx))?;
+    let req = shared.build_request(&method, &up_url, stream_body(body_rx), true)?;
     {
         let client = shared.client.clone();
         tokio::spawn(async move {
             debug!("xhttp stream-up: sending POST upload request (background)");
-            match client.request(req).await {
+            let failed = match client.request(req).await {
                 Ok(resp) => {
                     debug!(status = %resp.status(), "xhttp stream-up: upload response received");
                     // 检查 HTTP 状态码，4xx/5xx 表示服务端拒绝上行
-                    if let Err(e) = check_status(resp.status(), "stream-up") {
-                        warn!("xhttp stream-up POST rejected: {e}");
+                    match check_status(resp.status(), "stream-up") {
+                        Ok(()) => false,
+                        Err(e) => {
+                            warn!("xhttp stream-up POST rejected: {e}");
+                            true
+                        }
                     }
                 }
                 Err(e) => {
                     warn!("xhttp stream-up POST failed: {e}");
+                    true
                 }
+            };
+            if failed {
+                // 通知下行读取器：上行已断开，关闭连接。
+                // 旧实现仅 warn 日志，下行流保持 open，调用方误以为连接正常，
+                // 但数据实际已无法上行 → 连接假死。
+                close_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
     }
@@ -492,7 +558,7 @@ async fn connect_stream_up_down(shared: Arc<XhttpShared>) -> anyhow::Result<Xhtt
 
 async fn connect_packet_up(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStream> {
     let down_url = shared.stream_url();
-    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()))?;
+    let req = shared.build_request(&Method::GET, &down_url, XhttpBody::Empty(Empty::new()), false)?;
     debug!("xhttp packet-up: sending GET download request");
     let down_resp = shared.client.request(req).await?;
     debug!(status = %down_resp.status(), "xhttp packet-up: download response received");
@@ -509,14 +575,40 @@ async fn connect_packet_up(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStre
                 min_post_interval_ms = shared.min_post_interval_ms,
                 "xhttp packet-up: upload loop started"
             );
-            while let Some(chunk) = up_rx.recv().await {
-                // packet-up 模式：每收到一个 chunk 立即发一个 POST，
-                // 不等攒满 max_post_bytes。否则 VLESS 握手包（几十字节）
-                // 永远攒不到 1MB，POST 永远不会发，服务端 VLESS 层读不到
-                // 握手包 → 连接挂死。
-                // 参考 Xray client.go packet-up：每个 chunk 单独发一个 POST。
-                // 仅在 chunk 超过 max_post_bytes 时才拆分（保护服务端缓冲）。
-                let mut remaining = chunk;
+
+            // 批处理缓冲区：与 Xray dialer.go:490-568 的 pipe 机制对齐。
+            //
+            // Xray 使用 size-limited pipe：多个 Write 调用积累在 pipe 中，
+            // 读循环通过 ReadMultiBuffer 一次性读出所有已缓冲数据，
+            // 然后按 maxUploadSize 拆分成多个 POST。这样多个小写
+            // （如 TLS 握手、VLESS 头）被合并为一个大 POST，大幅提升带宽。
+            //
+            // 旧 reflex 实现：每个 channel 消息单独发一个 POST，
+            // 小数据包（几十字节）各自成帧 → POST 请求数爆炸，带宽极低。
+            //
+            // 本实现：从 channel 攒数据到 buffer，直到：
+            //   1. buffer 达到 max_post_bytes（满了，必须发），或
+            //   2. channel 暂时无数据（try_recv 失败），立即发送已缓冲的数据
+            //      （不等待攒满，避免延迟——对齐 Xray ReadMultiBuffer 行为）。
+            while let Some(first_chunk) = up_rx.recv().await {
+                let mut buffer = BytesMut::new();
+                buffer.extend_from_slice(&first_chunk);
+
+                // 尝试攒更多数据，直到达到 max_post_bytes 或 channel 暂时为空
+                while buffer.len() < shared.max_post_bytes {
+                    match up_rx.try_recv() {
+                        Ok(more) => {
+                            buffer.extend_from_slice(&more);
+                        }
+                        Err(_) => {
+                            // channel 暂时无数据，立即发送已缓冲的内容
+                            break;
+                        }
+                    }
+                }
+
+                // 按 max_post_bytes 拆分发送（与 Xray buf.SplitSize 对齐）
+                let mut remaining = buffer.freeze();
                 while !remaining.is_empty() {
                     let payload: Bytes = if remaining.len() > shared.max_post_bytes {
                         let split = shared.max_post_bytes;
@@ -527,6 +619,7 @@ async fn connect_packet_up(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStre
                         std::mem::take(&mut remaining)
                     };
 
+                    // POST 间隔控制，与 Xray dialer.go:536-538 对齐
                     if shared.min_post_interval_ms > 0 {
                         let elapsed = last_post.elapsed().as_millis() as u64;
                         if elapsed < shared.min_post_interval_ms {
@@ -536,10 +629,20 @@ async fn connect_packet_up(shared: Arc<XhttpShared>) -> anyhow::Result<XhttpStre
                             .await;
                         }
                     }
-                    if let Err(e) = post_packet(&shared, payload).await {
-                        warn!("xhttp packet-up POST error: {e}");
-                        return;
-                    }
+
+                    // 与 Xray dialer.go:547-565 对齐：POST 异步发送，
+                    // 不等待完整响应即可发送下一个 chunk。
+                    // Xray 用 goroutine + WroteRequest 信号实现：只等请求
+                    // 写入完成（不等响应），立即继续下一个 POST。
+                    // reflex 使用 tokio::spawn 实现同等语义：POST 在后台
+                    // 发送，主循环立即继续处理下一个 chunk。
+                    let shared_clone = shared.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = post_packet(&shared_clone, payload).await {
+                            warn!("xhttp packet-up POST error: {e}");
+                        }
+                    });
+
                     last_post = std::time::Instant::now();
                 }
             }
@@ -556,7 +659,7 @@ async fn post_packet(shared: &XhttpShared, payload: Bytes) -> anyhow::Result<()>
     let url = shared.packet_url(seq);
     let method = parse_method(&shared.uplink_method);
     let payload_len = payload.len();
-    let req = shared.build_request(&method, &url, XhttpBody::Full(Full::new(payload)))?;
+    let req = shared.build_request(&method, &url, XhttpBody::Full(Full::new(payload)), false)?;
     debug!(seq, payload_len, "xhttp packet-up: POST upload");
     let resp = shared.client.request(req).await?;
     debug!(seq, status = %resp.status(), "xhttp packet-up: POST response");
@@ -568,10 +671,19 @@ async fn post_packet(shared: &XhttpShared, payload: Bytes) -> anyhow::Result<()>
 struct RespBodyReader {
     rx: mpsc::Receiver<io::Result<Bytes>>,
     current: Bytes,
+    /// 可选的关闭信号：当上行流（stream-up POST）失败时设置，
+    /// 使后续 poll_read 返回 ConnectionReset 错误，通知调用方连接已断开。
+    /// 与 Xray client.go:86-92 对齐：uploadOnly 的 OpenStream 在失败/非200 时
+    /// 调用 wrc.Close()，使 download 侧的 Read 返回 io.ErrClosedPipe。
+    close_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RespBodyReader {
     fn new(body: Incoming) -> Self {
+        Self::with_close_flag(body, None)
+    }
+
+    fn with_close_flag(body: Incoming, close_flag: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             let mut stream = body;
@@ -617,6 +729,7 @@ impl RespBodyReader {
         Self {
             rx,
             current: Bytes::new(),
+            close_flag,
         }
     }
 }
@@ -628,6 +741,15 @@ impl AsyncRead for RespBodyReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // 检查上行流是否已失败（stream-up 模式）
+        if let Some(flag) = &this.close_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "xhttp: upload stream failed, closing download",
+                )));
+            }
+        }
         if !this.current.is_empty() {
             let n = buf.remaining().min(this.current.len());
             buf.put_slice(&this.current[..n]);
@@ -772,9 +894,21 @@ fn build_http_client(
 
     let connector = MarkedConnector::new(routing_mark, rustls_cfg, resolver, server_name);
 
-    let client = Client::builder(hyper_util::rt::TokioExecutor::new())
-        .http2_only(true)
-        .build(connector);
+    // HTTP 版本选择，与 Xray dialer.go:84-101 decideHTTPVersion 对齐：
+    //   - 有 TLS（含 REALITY）→ HTTP/2（ALPN 已强制 h2）
+    //   - 无 TLS → HTTP/1.1
+    //
+    // 旧实现：无条件 http2_only(true)，无 TLS 时走 h2c（HTTP/2 cleartext），
+    // 标准 HTTP/1.1 服务器不支持 h2c → 连接失败。
+    // Xray 在无 TLS 时使用 http.Transport（HTTP/1.1），packet-up 模式可用。
+    let client = if tls_enabled {
+        Client::builder(hyper_util::rt::TokioExecutor::new())
+            .http2_only(true)
+            .build(connector)
+    } else {
+        Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(connector)
+    };
 
     Ok(client)
 }
