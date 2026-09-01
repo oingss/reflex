@@ -1,0 +1,38 @@
+name: update cargo.lock
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Cargo.toml'
+
+env:
+  CARGO_TERM_COLOR: always
+  FEATURES: outbound-net
+
+jobs:
+  test-and-build:
+    name: update
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+
+      - name: Update Cargo.lock
+        run: cargo update -p tokio-tungstenite
+
+      - name: Commit updated Cargo.lock
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git diff --cached --quiet || git commit -m "chore: update Cargo.lock [skip ci]"
+          git push

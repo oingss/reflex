@@ -1,0 +1,72 @@
+name: macos ci
+
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FEATURES: outbound-net
+
+jobs:
+  # ── 1. 交叉编译 reflex ────────────────────────────────────────────────────
+  build:
+    name: Build / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:   aarch64-apple-darwin
+            os:       macos-latest
+            artifact: reflex-macos-aarch64
+            cross:    false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+
+      - name: Build reflex (macOS aarch64, native)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --bin reflex
+
+
+      - name: Collect binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir dist
+          BIN="target/${{ matrix.target }}/release/reflex"
+          cp "$BIN" "dist/reflex-darwin-aarch64"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci
+          name: "reflex ci"
+          prerelease: false
+          files: |
+            dist/*

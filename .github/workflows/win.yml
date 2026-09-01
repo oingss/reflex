@@ -1,0 +1,73 @@
+name: win ci
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. 交叉编译 reflex ────────────────────────────────────────────────────
+  build:
+    name: Build / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:   x86_64-pc-windows-msvc
+            os:       windows-latest
+            artifact: reflex-windows-x86_64
+            cross:    false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build reflex (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }} \
+            --bin reflex \
+            --no-default-features \
+            --features mimalloc
+
+      - name: Collect binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/reflex.exe"
+          mkdir dist
+          cp "$BIN" "dist/reflex-a-windows-x86_64.exe"
+
+      - name: Create GitHub Release
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ci
+          name:       "reflex ci"
+          files:      |
+            dist/reflex-a-windows-x86_64.exe
