@@ -1,0 +1,312 @@
+// ============================================================================
+// 入站配置模板（对应顶层 "inbounds" 字段）
+//
+// 拷贝到主配置时，把 "inbounds" 数组的内容填入顶层 "inbounds" 键即可。
+//
+// 传输层与 REALITY 说明（VLESS/VMess/Trojan/Shadowsocks inbound 均支持）：
+//   - "transport"：对齐 sing-box V2RayTransportOptions，
+//     支持 {"type":"tcp"}（缺省）/ ws / grpc / xhttp；
+//   - "tls.reality"：服务端 REALITY（对齐 sing-box inbound tls.reality），
+//     启用后无需证书/私钥，未通过校验的客户端回落转发到 handshake.server；
+//     REALITY 不只限 VLESS——VMess/Trojan 同样可用（与 sing-box 一致）；
+//   - Shadowsocks inbound 的 transport/tls 为 reflex 扩展（sing-box 原生不支持），
+//     仅作用于 TCP 链路，UDP 会话不受影响。
+// ============================================================================
+
+{
+  "inbounds": [
+    // ══ 透明代理类 ═══════════════════════════════════════════════════════════
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7893,
+      "mark": 1
+    },
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "mtu": 9000,
+      "address": [
+        "172.31.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "auto_route": true,
+      "iproute2_table_index": 2022,
+      "iproute2_rule_index": 9000,
+      "strict_route": true,
+      "stack": "system",
+      "exclude_interface": ["eth0"],
+      "exclude_uid": [0],
+      "udp_timeout": 300
+    },
+
+    // ══ 本地代理类 ═══════════════════════════════════════════════════════════
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    },
+    {
+      // 纯 HTTP 代理入站（CONNECT 隧道 + 转发代理）
+      // 认证可选：users 为空或省略则不鉴权；填写后使用 Proxy-Authorization: Basic
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+      // "users": [{"username": "admin", "password": "secret"}]
+    },
+    {
+      // 纯 SOCKS5 代理入站（CONNECT + UDP ASSOCIATE）
+      // 认证可选：users 为空或省略则不鉴权；填写后使用 RFC 1929 用户名/密码子协商
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+      // "users": [{"username": "admin", "password": "secret"}]
+    },
+
+    // ══ DNS 入站（配合 route 的 hijack-dns 动作）══════════════════════════════
+    {
+      "type": "dns",
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "listen_port": 5353
+    },
+
+    // ══ 协议入站：VLESS ══════════════════════════════════════════════════════
+    {
+      // VLESS + REALITY（服务端伪装站点 + 回落，推荐生产使用）
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "reality": {
+          "enabled": true,
+          // 回落目标：未通过 Reality 校验的流量（扫描/探测）真实转发到该站点
+          "handshake": { "server": "www.apple.com", "server_port": 443 },
+          // x25519 私钥（base64url）；对应客户端 public_key
+          "private_key": "服务端x25519私钥(base64url)",
+          // shortId 白名单（hex，每项 ≤ 8 字节）；对应客户端 short_id
+          "short_id": ["0123abcd", "abcdef01"],
+          // 客户端时间戳最大允许偏差（秒），缺省 60
+          "max_time_difference": 60
+        }
+      }
+      // "transport": { "type": "tcp" }
+    },
+    {
+      // VLESS + WebSocket + TLS（可再套 CDN）
+      "type": "vless",
+      "tag": "vless-ws-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "your.domain.com",
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/your-path",
+        // 可选：Host 头校验 / 额外头校验 / 0-RTT 早期数据
+        "host": "your.domain.com"
+        // "headers": { "X-Custom": "value" },
+        // "max_early_data": 2048,
+        // "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      // VLESS + gRPC + TLS（基于 HTTP/2；客户端 TLS alpn 需含 h2）
+      "type": "vless",
+      "tag": "vless-grpc-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "your-grpc-server.example.com",
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": {
+        "type": "grpc",
+        // 客户端 path 为 /<service_name>/Tun，需与出站 service_name 一致
+        "service_name": "GunService"
+      }
+    },
+    {
+      // VLESS + XHTTP + TLS（SplitHTTP，packet-up/stream-up/stream-one 全模式自适应）
+      "type": "vless",
+      "tag": "vless-xhttp-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "your.domain.com",
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": {
+        "type": "xhttp",
+        "path": "/xhttp"
+        // "host": "your.domain.com",
+        // "mode": "auto"   // auto/packet-up/stream-up/stream-one，服务端全模式自适应
+      }
+    },
+
+    // ══ 协议入站：VMess / Trojan（传输层与 REALITY 用法与 VLESS 相同）═════════
+    {
+      // Trojan + gRPC + TLS（sing-box 要求 trojan inbound 启用 TLS）
+      "type": "trojan",
+      "tag": "trojan-grpc-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "password": "your-password" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "your.domain.com",
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": { "type": "grpc", "service_name": "GunService" }
+    },
+    {
+      // VMess + WebSocket + TLS（alterId 固定为 0，即 AEAD）
+      "type": "vmess",
+      "tag": "vmess-ws-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "alter_id": 0 }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": { "type": "ws", "path": "/vmess" }
+    },
+
+    // ══ 协议入站：Shadowsocks 2022 ═══════════════════════════════════════════
+    {
+      // 基础形态：裸 TCP + UDP（与 sing-box 一致）
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "::",
+      "listen_port": 8388,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "base64位32字节PSK"
+      // 多用户（中转）形态：
+      // "users": [
+      //   { "name": "alice", "password": "iPSK" },
+      //   { "name": "bob",   "password": "iPSK" }
+      // ],
+      // "password": "中转 PSK（EIH 用）"
+    },
+    {
+      // 扩展形态：SS-over-WebSocket + TLS（reflex 扩展，对齐 ss outbound 的传输能力）
+      // transport 仅作用于 TCP 链路；UDP 会话不受影响
+      "type": "shadowsocks",
+      "tag": "ss-ws-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "base64位32字节PSK",
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "transport": { "type": "ws", "path": "/ss" }
+    },
+
+    // ══ 协议入站：QUIC 系（不适用 v2ray 传输层）══════════════════════════════
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "password": "your-password" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      }
+      // "up_mbps": 100, "down_mbps": 500
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "alice", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "your-password" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      },
+      "congestion_control": "bbr"
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [{ "name": "alice", "password": "your-password" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      }
+      // "padding_scheme": ...
+    },
+    {
+      "type": "shadowquic",
+      "tag": "shadowquic-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "username": "alice", "password": "your-password" }],
+      "server_name": "www.bing.com", // JLS SNI 伪装域名，与出站 server_name 一致
+      "jls_upstream": "www.bing.com:443" // JLS 伪装上游（真实 HTTPS 站点）
+    },
+
+    // ══ 协议入站：WireGuard（隧道，自带加密，无需 TLS/transport）═════════════
+    {
+      "type": "wireguard",
+      "tag": "wg-in",
+      "listen": "::",
+      "listen_port": 51820,
+      "address": ["10.0.0.1/24", "fd00::1/64"],
+      "private_key": "服务端私钥(base64)",
+      "peers": [
+        {
+          "public_key": "客户端公钥(base64)",
+          "allowed_ips": ["10.0.0.2/32", "fd00::2/128"]
+          // "pre_shared_key": "可选"
+        }
+      ]
+    },
+
+    // ══ 协议入站：Naive（HTTP/2 隧道，需 TLS）═════════════════════════════════
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "username": "user", "password": "your-password" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/reflex/certs/fullchain.pem",
+        "key_path": "/etc/reflex/certs/privkey.pem"
+      }
+    }
+  ]
+}
