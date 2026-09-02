@@ -100,6 +100,23 @@ pub struct FakeIpConfig {
     pub inet6_range: Option<String>,
 }
 
+/// 配置文件完全省略 `dns` 段（或写了空 `dns: {}`）时，隐式注入的兜底
+/// server tag：指向本地系统解析（`local://`，即 resolv.conf + hosts）。
+///
+/// 对齐 sing-box / flux 的行为：这两者都没有强制要求用户显式配置 DNS
+/// 上游——sing-box 未配置 `dns` 时走内置默认解析；flux 压根没有独立 DNS
+/// 模块，各协议出站遇到域名目标时直接调用 `tokio::net::lookup_host`
+///（本质就是让操作系统的 getaddrinfo 去查 resolv.conf）。
+///
+/// reflex 的 DNS 模块本身更强大（支持 DoH/DoT/DoQ/FakeIP/规则分流等），
+/// 但此前的行为是「`dns.servers` 为空 → 整个 DNS 模块被禁用，所有域名
+/// 解析请求直接报错」，这与用户从 sing-box/flux 迁移过来的直觉不符，
+/// 也是 "no upstream" 报错的根源。此常量配合
+/// [`DnsConfig::with_implicit_local_fallback`] 修复这一差异：只要用户
+/// 没有显式配置任何 `dns.servers`，就自动注入一个 `local://` 兜底 server
+/// 并让 `dns.final` 指向它，效果与系统 resolver 直接解析等价。
+pub const IMPLICIT_LOCAL_DNS_TAG: &str = "local";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DnsConfig {
     /// DNS 服务器列表
@@ -160,6 +177,39 @@ pub struct DnsConfig {
     /// > 不能与 `disable_cache: true` 同时使用。
     #[serde(default)]
     pub optimistic_timeout: u64,
+}
+
+impl DnsConfig {
+    /// 若用户完全没有配置 `dns.servers`（即省略整个 `dns` 段，或写了
+    /// `"dns": {}`），注入一个隐式的 `local://` 兜底 server 并把
+    /// `dns.final` 指向它，使域名解析自动退化为系统 resolver
+    /// （resolv.conf + hosts），行为对齐 sing-box / flux 的默认表现。
+    ///
+    /// 仅在 `servers` 为空时生效；只要用户写了任何一个 server（哪怕只有
+    /// 一条），就认为是有意接管 DNS 配置，不做任何隐式修改——避免用户
+    /// 手滑忘记把 `final` 指过去时，静默叠加一个他们没预料到的兜底项。
+    ///
+    /// 调用时机：解析配置文本之后、[`Config::validate`] 之前
+    ///（见 [`crate::config::Config::from_text_with_format`]）。
+    pub fn with_implicit_local_fallback(mut self) -> Self {
+        if !self.servers.is_empty() {
+            return self;
+        }
+        self.servers.push(DnsServerConfig {
+            tag: IMPLICIT_LOCAL_DNS_TAG.to_string(),
+            address: "local://".to_string(),
+            detour: None,
+            fakeip: None,
+            domain_resolver: None,
+            client_subnet: None,
+            timeout: default_dns_timeout(),
+            strategy: None,
+            sni: None,
+            insecure: false,
+        });
+        self.r#final = DnsServerRef::single(IMPLICIT_LOCAL_DNS_TAG);
+        self
+    }
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -855,6 +905,47 @@ mod tests {
     fn strategy_default() {
         let dns = DnsConfig::default();
         assert_eq!(dns.strategy, ResolveStrategy::PreferIpv4);
+    }
+
+    // ── 隐式 local:// 兜底（对齐 sing-box / flux：未配置 dns 时不应导致
+    // 域名解析整体失效）──────────────────────────────────────────────────
+
+    #[test]
+    fn implicit_local_fallback_injects_when_empty() {
+        // 完全没配置 dns 段（DnsConfig::default() 的状态：servers 为空）
+        let dns = DnsConfig::default().with_implicit_local_fallback();
+        assert_eq!(dns.servers.len(), 1);
+        assert_eq!(dns.servers[0].tag, IMPLICIT_LOCAL_DNS_TAG);
+        assert_eq!(dns.servers[0].address, "local://");
+        assert_eq!(dns.servers[0].protocol(), DnsProtocol::Local);
+        assert_eq!(dns.r#final, DnsServerRef::single(IMPLICIT_LOCAL_DNS_TAG));
+    }
+
+    #[test]
+    fn implicit_local_fallback_noop_when_user_configured_servers() {
+        // 用户显式配置了至少一个 server → 不做任何隐式修改，
+        // 即使他们忘记设置 final（该场景应交给 Config::validate 报错，
+        // 而不是被这里静默"修好"）。
+        let v = json!({
+            "servers": [{ "tag": "remote", "address": "1.1.1.1" }],
+            "final": "remote"
+        });
+        let dns: DnsConfig = serde_json::from_value(v).unwrap();
+        let dns2 = dns.clone().with_implicit_local_fallback();
+        assert_eq!(dns2.servers.len(), 1);
+        assert_eq!(dns2.servers[0].tag, "remote");
+        assert_eq!(dns2.r#final, DnsServerRef::single("remote"));
+    }
+
+    #[test]
+    fn implicit_local_fallback_empty_json_object_also_injects() {
+        // 显式写 "dns": {} 与完全省略 dns 段等价：servers 仍是空数组，
+        // 同样应触发兜底注入。
+        let dns: DnsConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(dns.servers.is_empty());
+        let dns = dns.with_implicit_local_fallback();
+        assert_eq!(dns.servers.len(), 1);
+        assert_eq!(dns.servers[0].address, "local://");
     }
 
     // ── ProxyDomainResolverConfig 反序列化（对齐 sing-box DomainResolveOptions）──
