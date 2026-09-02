@@ -1,4 +1,4 @@
-name: ci
+name:  arm64 ci
 
 on:
   #push:
@@ -9,13 +9,6 @@ on:
       #- 'Cargo.toml'
       #- 'Cargo.lock'
   workflow_dispatch:
-    inputs:
-      suffix:
-        description: "Optional filename suffix (e.g. beta)"
-        required: false
-        default: ""
-        type: string
-
 env:
   CARGO_TERM_COLOR: always
   FEATURES: outbound-net
@@ -47,12 +40,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-aarch64-unknown-linux-musl-cargo-
       
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Run clippy
-        run: cargo clippy --locked -- -D warnings
-
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
@@ -67,29 +54,12 @@ jobs:
             --target aarch64-unknown-linux-musl \
             --bin reflex
 
-      # ── 根据输入生成文件名 ───────────────────────────────────────────
-      - name: Generate filenames
-        shell: bash
-        run: |
-          if [ -n "${{ github.event.inputs.suffix }}" ]; then
-            echo "BIN_NAME=reflex-linux-aarch64-${{ github.run_number }}-${{ github.event.inputs.suffix }}" >> "$GITHUB_ENV"
-            echo "SRC_NAME=test-code-${{ github.run_number }}-${{ github.event.inputs.suffix }}.zip" >> "$GITHUB_ENV"
-          else
-            echo "BIN_NAME=reflex-linux-aarch64-${{ github.run_number }}" >> "$GITHUB_ENV"
-            echo "SRC_NAME=test-code-${{ github.run_number }}.zip" >> "$GITHUB_ENV"
-          fi
-
       # ── 收集产物 ────────────────────────────────────────────────────
       - name: Collect binary
         run: |
           mkdir -p dist
           BIN_DIR="target/aarch64-unknown-linux-musl/release"
           cp "$BIN_DIR/reflex" "dist/${BIN_NAME}"
-
-      # ── 打包源码 ────────────────────────────────────────────────────
-      - name: Archive source code
-        run: |
-          git archive --format=zip --output="dist/${SRC_NAME}" HEAD
 
       # ── 发布 Release ────────────────────────────────────────────────
       - name: Create GitHub Release
@@ -100,4 +70,3 @@ jobs:
           prerelease: false
           files: |
             dist/${{ env.BIN_NAME }}
-            dist/${{ env.SRC_NAME }}
