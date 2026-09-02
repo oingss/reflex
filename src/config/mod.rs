@@ -134,7 +134,7 @@ impl Config {
 
     /// 按指定格式解析配置文本。
     pub fn from_text_with_format(s: &str, fmt: ConfigFormat) -> anyhow::Result<Self> {
-        let config: Self = match fmt {
+        let mut config: Self = match fmt {
             ConfigFormat::Json => {
                 // JSON 路径保留 // 和 # 注释剥离（兼容 JSONC 写法）。
                 let stripped = strip_comments(s);
@@ -147,6 +147,13 @@ impl Config {
                 serde_yaml::from_str(s).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
             }
         };
+        // 用户完全未配置 dns.servers 时，隐式兜底为本地系统解析（对齐
+        // sing-box / flux 的默认行为），避免所有域名解析请求直接报
+        // "no upstream"。必须在 validate() 之前调用：validate 里
+        // dns.final 的 tag 校验依赖 servers 是否为空来判断是否跳过检查，
+        // 注入后 servers 非空，需要新 final 与新 server tag 保持一致
+        //（with_implicit_local_fallback 内部已同步设置好两者）。
+        config.dns = config.dns.with_implicit_local_fallback();
         config.validate()?;
         Ok(config)
     }
