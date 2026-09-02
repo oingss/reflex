@@ -236,9 +236,14 @@ impl App {
         // 使用两阶段初始化：先用 Arc<OnceLock> 延迟注入。
         let (dns_tx, dns_rx) = mpsc::channel::<crate::inbound::dns::DnsQuery>(256);
 
-        // DNS 缺失（dns.servers 为空）时使用 disabled resolver：
-        // 无 upstream、无缓存，resolve_domain 返回错误（dispatcher 优雅降级）。
-        // 不启动 DNS 处理循环（下方 dns_enabled 控制不 spawn run task）。
+        // 正常配置加载路径（Config::from_file / from_text_with_format）在
+        // 解析后已经通过 DnsConfig::with_implicit_local_fallback 保证
+        // dns.servers 不会为空（用户未配置时会隐式注入 local:// 兜底，
+        // 对齐 sing-box / flux 的默认行为）。这里的 disabled resolver 分支
+        // 只作为兜底防线，覆盖绕过该注入点、直接构造 Config 的场景
+        //（例如测试代码手动构造 Config 结构体）：此时无 upstream、无缓存，
+        // resolve_domain 返回错误（dispatcher 优雅降级），不启动 DNS 处理
+        // 循环（下方 dns_enabled 控制不 spawn run task）。
         let dns_enabled = !config.dns.servers.is_empty();
 
         // 第一阶段：不带 outbounds 构建 DNS resolver（detour 暂时为直连）
@@ -260,7 +265,7 @@ impl App {
             }
             r
         } else {
-            info!("dns: no servers configured, DNS module disabled (domain resolution will fail)");
+            info!("dns: no servers configured (bypassed implicit local:// fallback), DNS module disabled (domain resolution will fail)");
             DnsResolver::disabled(clash_mode.clone())
         });
 
