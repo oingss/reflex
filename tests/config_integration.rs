@@ -256,6 +256,45 @@ fn comment_stripping() {
     Config::from_text(s).unwrap();
 }
 
+// ── DNS 隐式兜底（未配置 dns 段时不应导致域名解析整体失效）───────────────────
+
+#[test]
+fn no_dns_section_falls_back_to_local_and_passes_validate() {
+    // 完全不写 dns 段，只有出站 + 路由（贴近用户从 sing-box 迁移过来时
+    // 的典型最小配置）。此前这种配置能通过 validate，但运行时 DNS 模块
+    // 会被整体禁用，所有域名目标解析失败（"no upstream"）。
+    let s = r#"{
+        "outbounds": [{"type":"direct","tag":"direct"}],
+        "route": {"final":"direct","rules":[],"rule_set":[]}
+    }"#;
+    let cfg = Config::from_text(s).unwrap();
+    assert_eq!(cfg.dns.servers.len(), 1);
+    assert_eq!(cfg.dns.servers[0].address, "local://");
+    assert_eq!(cfg.dns.r#final.as_slice(), &["local".to_string()]);
+}
+
+#[test]
+fn empty_dns_object_also_falls_back_to_local() {
+    // 显式写 "dns": {} 效果应与完全省略该字段一致。
+    let s = r#"{
+        "dns": {},
+        "outbounds": [{"type":"direct","tag":"direct"}],
+        "route": {"final":"direct","rules":[],"rule_set":[]}
+    }"#;
+    let cfg = Config::from_text(s).unwrap();
+    assert_eq!(cfg.dns.servers.len(), 1);
+    assert_eq!(cfg.dns.servers[0].address, "local://");
+}
+
+#[test]
+fn explicit_dns_servers_are_not_touched_by_fallback() {
+    // 用户显式配置了 dns.servers 时，不应注入任何隐式 server。
+    let cfg = Config::from_text(FULL_CONFIG).unwrap();
+    assert_eq!(cfg.dns.servers.len(), 3);
+    assert!(cfg.dns.servers.iter().all(|s| s.address != "local://"));
+    assert_eq!(cfg.dns.r#final.as_slice(), &["remote".to_string()]);
+}
+
 // ── UUID 校验 ─────────────────────────────────────────────────────────────────
 
 #[test]
