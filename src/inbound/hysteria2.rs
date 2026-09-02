@@ -59,7 +59,7 @@ use crate::inbound::{
 use crate::outbound::AsyncReadWrite;
 use crate::protocol::hysteria2::{
     open_h3_control_streams, parse_addr_to_target, parse_headers_from_qpack, parse_udp_datagram,
-    read_h3_frame, read_tcp_request, read_varint_async, send_udp_fragmented,
+    read_h3_frame_payload, read_tcp_request, read_varint_async, send_udp_fragmented,
     write_auth_fail_response, write_auth_ok_response, write_h3_not_found_response,
     write_tcp_response, QuinnBiStream, AUTH_URL_PATH, FRAME_TYPE_TCP_REQUEST, H3_FRAME_HEADERS,
     H3_FRAME_SETTINGS, HY2_ALPN, QUIC_MAX_CONNECTION_RECEIVE_WINDOW, QUIC_STREAM_RECEIVE_WINDOW,
@@ -289,7 +289,10 @@ async fn handle_connection(
 
         match frame_type {
             H3_FRAME_HEADERS => {
-                let (_, payload) = match read_h3_frame(&mut recv).await {
+                // frame type（H3_FRAME_HEADERS）已经在上面 read_varint_async 里读掉了，
+                // 这里只需读剩余的 [len varint][payload]，不能再调用会重新读 type 的
+                // read_h3_frame（否则把 len varint 错当成 type 读，QPACK payload 整体错位）。
+                let payload = match read_h3_frame_payload(&mut recv).await {
                     Ok(v) => v,
                     Err(e) => {
                         debug!(tag = %tag, peer = %display_sockaddr(peer), err = %e, "hy2 inbound: bad pre-auth HEADERS frame");
