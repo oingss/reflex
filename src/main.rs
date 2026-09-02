@@ -571,6 +571,17 @@ async fn run_proxy(args: &[String]) -> anyhow::Result<()> {
 
     info!(version=env!("CARGO_PKG_VERSION"), config=%resolved_config, "reflex starting");
 
+    // 是否配置了 TUN 入站：只有 TUN 才需要下面这套"广播信号 + 30s 宽限期
+    // 等待任务自然退出"的优雅关闭流程（TUN teardown 要删路由、恢复 DNS、
+    // 关 WFP 会话，跳过会导致状态残留）。其余入站（hy2/mixed/trojan 等）
+    // 的 accept 循环目前并不监听 shutdown 信号，多等 30s 只是白白等到
+    // 超时后被强制 abort，没有任何清理收益，所以没有 TUN 时直接走原来
+    // "收到信号就退出" 的简单路径，不进入宽限等待。
+    let has_tun_inbound = config
+        .inbounds
+        .iter()
+        .any(|ib| matches!(ib, reflex::config::inbound::InboundConfig::Tun(_)));
+
     let app = App::start_with_config(config).await?;
 
     // 优雅关闭：收到 Ctrl+C/SIGTERM 后广播 shutdown 信号，TUN 等长运行任务
@@ -582,8 +593,15 @@ async fn run_proxy(args: &[String]) -> anyhow::Result<()> {
     let mut app_wait = Box::pin(app.wait());
     tokio::select! {
         _ = signal_shutdown() => {
-            info!("shutdown signal received, waiting for graceful teardown");
             reflex::app::shutdown::signal();
+            if !has_tun_inbound {
+                // 没有 TUN：没有需要等待的"必须完成"的清理动作，广播完信号
+                // 直接返回，进程退出时其余任务随 JoinSet drop 一并终止，
+                // 不再空等 30s 宽限期。
+                info!("shutdown signal received, no tun inbound configured, exiting immediately");
+                return Ok(());
+            }
+            info!("shutdown signal received, waiting for graceful teardown");
             // Windows 上 teardown 通过 powershell/netsh/ipconfig 子进程清理
             // 路由/WFP/DNS，PowerShell 冷启动 1-3s，多次 netsh 累积可达 5-10s+。
             // 旧的 5s grace 不够，超时后进程退出会强制中断 teardown → 路由残留。
