@@ -194,9 +194,23 @@ pub fn write_h3_frame(buf: &mut BytesMut, frame_type: u64, payload: &[u8]) {
     buf.put_slice(payload);
 }
 
-/// 从 quinn::RecvStream 读取一个 HTTP/3 frame，返回 (frame_type, payload)
+/// 从 quinn::RecvStream 读取一个 HTTP/3 frame，返回 (frame_type, payload)。
+///
+/// 注意：本函数会自行读取 frame type varint。如果调用方已经通过
+/// [`read_varint_async`] 读过 frame type（例如为了 match 分发帧类型），
+/// 请改用 [`read_h3_frame_payload`]，否则会把"长度 varint"错当成
+/// "类型 varint"读，导致后续 QPACK payload 解析全部错位
+///（典型症状：`qpack payload too short` / 认证阶段莫名失败）。
 pub async fn read_h3_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<(u64, Vec<u8>)> {
     let frame_type = read_varint_async(recv).await?;
+    let payload = read_h3_frame_payload(recv).await?;
+    Ok((frame_type, payload))
+}
+
+/// 读取 HTTP/3 frame 的 `[len varint][payload]` 部分，frame type 已由
+/// 调用方读取并匹配过。用于 pre-auth 循环等"先读 type 做分支，再读剩余
+/// 帧内容"的场景，避免与 [`read_h3_frame`] 重复消费 type varint。
+pub async fn read_h3_frame_payload(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
     let payload_len = read_varint_async(recv).await?;
     // 放宽到 1MB，避免大 HEADERS 帧（含长 padding）被误拒
     anyhow::ensure!(
@@ -207,7 +221,7 @@ pub async fn read_h3_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<(u64,
     if payload_len > 0 {
         recv.read_exact(&mut payload).await?;
     }
-    Ok((frame_type, payload))
+    Ok(payload)
 }
 
 // ── QPACK 编解码 ──────────────────────────────────────────────────────────────
