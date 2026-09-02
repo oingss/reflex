@@ -545,7 +545,11 @@ async fn run_proxy(args: &[String]) -> anyhow::Result<()> {
              (mixed inbound 127.0.0.1:7890 + direct outbound)",
             resolved_config
         );
-        reflex::config::Config::default()
+        let mut c = reflex::config::Config::default();
+        // 与 from_file 走的 from_text_with_format 路径保持一致：dns.servers
+        // 为空时隐式兜底为本地系统解析，否则这条路径下域名解析会直接失效。
+        c.dns = c.dns.with_implicit_local_fallback();
+        c
     } else {
         reflex::config::Config::from_file(&resolved_config)?
     };
