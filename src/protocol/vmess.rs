@@ -26,8 +26,25 @@
 //! 加解密、chunk 流编解码器。连接管理、拨号、角色逻辑分别在
 //! `outbound/vmess.rs`（客户端）与 `inbound/vmess.rs`（服务端）。
 
-use std::io;
-use std::net::{IpAddr, SocketAddr};
+// ── FNV-1a 32-bit（vmess header 明文校验和）─────────────────────────────────
+//
+// **重要**：必须是独立的 32-bit FNV-1a（offset basis 0x811c9dc5，
+// prime 0x01000193），不能用 `fnv` crate 的 `FnvHasher`——该 crate 实现的是
+// 64-bit FNV-1a（Rust `Hasher` trait 语义），`finish() as u32` 只是截断
+// 64-bit 状态的低 32 位，数值上与原生 32-bit FNV-1a 完全不同。
+// v2ray/Xray 官方实现（Go `hash/fnv`）用的是 `fnv.New32a()`，即原生 32-bit
+// 版本，此前误用 64-bit-then-truncate 导致这里永远无法与真实客户端对上，
+// 即使 AEAD 解密（密钥/KDF）全部正确也会报 FNV1a checksum mismatch。
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h
+}
+
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -375,9 +392,6 @@ impl RequestHeader {
 
     /// 构建明文 header 字节（含末尾 FNV1a checksum）
     pub fn encode(&self, target: &Target) -> Bytes {
-        use fnv::FnvHasher;
-        use std::hash::Hasher;
-
         let padding_len: usize = (rand_array::<1>()[0] % 16) as usize;
 
         let mut buf = BytesMut::with_capacity(64);
@@ -399,9 +413,7 @@ impl RequestHeader {
         }
 
         // FNV1a-32 checksum（覆盖整个 header 除 checksum 本身）
-        let mut h = FnvHasher::default();
-        h.write(&buf);
-        buf.put_u32(h.finish() as u32);
+        buf.put_u32(fnv1a32(&buf));
 
         buf.freeze()
     }
@@ -634,12 +646,8 @@ pub fn parse_server_handshake(buf: &[u8], user_key: &[u8; 16]) -> anyhow::Result
         "vmess handshake: header truncated (missing fnv checksum)"
     );
 
-    use fnv::FnvHasher;
-    use std::hash::Hasher;
-    let mut h = FnvHasher::default();
-    h.write(&plain[..addr_end]);
     anyhow::ensure!(
-        (h.finish() as u32).to_be_bytes() == plain[addr_end..addr_end + 4],
+        fnv1a32(&plain[..addr_end]).to_be_bytes() == plain[addr_end..addr_end + 4],
         "vmess handshake: FNV1a checksum mismatch"
     );
 
@@ -1320,6 +1328,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for VmessStr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FNV-1a 32-bit 已知测试向量（IETF/FNV 官方参考值），确保用的是原生
+    /// 32-bit 算法（offset basis 0x811c9dc5, prime 0x01000193），而不是
+    /// `fnv` crate 64-bit 版本截断成 32-bit 的错误结果——这两者数值不同，
+    /// 此前的 bug 正是把 64-bit 结果强转 u32，导致与真实 vmess 客户端
+    /// （Xray/v2ray，用标准 32-bit FNV-1a）永远对不上。
+    #[test]
+    fn fnv1a32_known_vectors() {
+        assert_eq!(fnv1a32(b""), 0x811c9dc5);
+        assert_eq!(fnv1a32(b"a"), 0xe40c292c);
+        assert_eq!(fnv1a32(b"foobar"), 0xbf9cf968);
+    }
 
     #[test]
     fn parse_uuid_ok() {
