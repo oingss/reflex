@@ -96,8 +96,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           BIN="target/${{ matrix.target }}/release/reflex"
+          SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
           mkdir -p dist
-          cp "$BIN" "dist/reflex-android-arm64"
+          cp "$BIN" "dist/reflex-android-arm64-${SUFFIX}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

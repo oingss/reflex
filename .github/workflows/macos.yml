@@ -60,7 +60,8 @@ jobs:
         run: |
           mkdir dist
           BIN="target/${{ matrix.target }}/release/reflex"
-          cp "$BIN" "dist/reflex-darwin-aarch64"
+          SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
+          cp "$BIN" "dist/reflex-darwin-aarch64-${SUFFIX}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

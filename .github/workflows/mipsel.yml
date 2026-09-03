@@ -120,7 +120,9 @@ jobs:
       - name: Collect binary
         run: |
           mkdir -p dist
-          cp "target/${{ env.TARGET }}/release/reflex" "dist/reflex-linux-mipsel"
+          SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
+          cp "target/${{ env.TARGET }}/release/reflex" "dist/reflex-linux-mipsel-${SUFFIX}"
+          echo "BIN_PATH=dist/reflex-linux-mipsel-${SUFFIX}" >> "$GITHUB_ENV"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -128,4 +130,4 @@ jobs:
           tag_name: ci
           name: "reflex ci"
           prerelease: false
-          files: dist/reflex-linux-mipsel
+          files: ${{ env.BIN_PATH }}

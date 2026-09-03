@@ -60,8 +60,10 @@ jobs:
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/reflex.exe"
+          SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
           mkdir dist
-          cp "$BIN" "dist/reflex-a-windows-x86_64.exe"
+          cp "$BIN" "dist/reflex-a-windows-x86_64-${SUFFIX}.exe"
+          echo "BIN_PATH=dist/reflex-a-windows-x86_64-${SUFFIX}.exe" >> "$GITHUB_ENV"
 
       - name: Create GitHub Release
         if: runner.os == 'Windows'
@@ -70,4 +72,4 @@ jobs:
           tag_name:   ci
           name:       "reflex ci"
           files:      |
-            dist/reflex-a-windows-x86_64.exe
+            ${{ env.BIN_PATH }}
