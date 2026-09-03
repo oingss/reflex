@@ -96,15 +96,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Zip source
+        id: zip
         run: |
           mkdir -p dist
-          git archive --format=zip --output=dist/reflex-src-${{ github.run_number }}.zip HEAD
+          if [ ! -f update.log ]; then
+            echo "update.log not found in repo root" >&2
+            exit 1
+          fi
+          NAME="$(head -n 1 update.log | tr -d '\r\n')"
+          if [ -z "$NAME" ]; then
+            echo "update.log first line is empty" >&2
+            exit 1
+          fi
+          echo "zip_name=$NAME" >> "$GITHUB_OUTPUT"
+          git archive --format=zip --output="dist/$NAME" HEAD
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: code
-          name: "reflex code"
+          tag_name: ci
+          name: "reflex ci"
           prerelease: false
           files: |
-            dist/reflex-src-${{ github.run_number }}.zip
+            dist/${{ steps.zip.outputs.zip_name }}
