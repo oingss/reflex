@@ -62,8 +62,8 @@ jobs:
           BIN="target/${{ matrix.target }}/release/reflex.exe"
           SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
           mkdir dist
-          cp "$BIN" "dist/reflex-a-windows-x86_64-${SUFFIX}.exe"
-          echo "BIN_PATH=dist/reflex-a-windows-x86_64-${SUFFIX}.exe" >> "$GITHUB_ENV"
+          cp "$BIN" "dist/reflex-windows-x86_64-${SUFFIX}.exe"
+          echo "BIN_PATH=dist/reflex-windows-x86_64-${SUFFIX}.exe" >> "$GITHUB_ENV"
 
       - name: Create GitHub Release
         if: runner.os == 'Windows'
