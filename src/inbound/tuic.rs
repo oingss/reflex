@@ -851,9 +851,15 @@ async fn read_address(recv: &mut quinn::RecvStream) -> Option<(ParsedAddr, usize
             let mut len_buf = [0u8; 1];
             recv.read_exact(&mut len_buf).await.ok()?;
             let len = len_buf[0] as usize;
-            rest.resize(1 + len + 2, 0);
+            // 流中此时剩余的是 domain(len 字节) + port(2 字节)，
+            // 不应再额外多读 1 字节（此前误将 len_buf 也计入 rest 容量，
+            // 导致 read_exact 多消费了 domain 的第一个字节乃至后续用户数据）。
+            rest.resize(len + 2, 0);
             recv.read_exact(&mut rest).await.ok()?;
-            rest[0] = len_buf[0];
+            let mut full_rest = Vec::with_capacity(1 + rest.len());
+            full_rest.push(len_buf[0]);
+            full_rest.extend_from_slice(&rest);
+            rest = full_rest;
         }
         ATYP_IPV4 => {
             rest.resize(6, 0);
