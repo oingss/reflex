@@ -84,3 +84,27 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --locked -- -D warnings
+
+  package:
+    name: package source
+    needs: [check, test, clippy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip source
+        run: |
+          mkdir -p dist
+          git archive --format=zip --output=dist/reflex-src-${{ github.run_number }}.zip HEAD
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: code
+          name: "reflex code"
+          prerelease: false
+          files: |
+            dist/reflex-src-${{ github.run_number }}.zip
