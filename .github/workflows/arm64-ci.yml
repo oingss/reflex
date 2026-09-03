@@ -54,7 +54,9 @@ jobs:
         run: |
           mkdir -p dist
           BIN_DIR="target/aarch64-unknown-linux-musl/release"
-          cp "$BIN_DIR/reflex" "dist/${BIN_NAME}"
+          SUFFIX="$(head -n 1 update.log | tr -d '\r\n')"
+          cp "$BIN_DIR/reflex" "dist/${BIN_NAME}-${SUFFIX}"
+          echo "BIN_PATH=dist/${BIN_NAME}-${SUFFIX}" >> "$GITHUB_ENV"
 
       # ── 发布 Release ────────────────────────────────────────────────
       - name: Create GitHub Release
@@ -64,4 +66,4 @@ jobs:
           name: "reflex ci"
           prerelease: false
           files: |
-            dist/${{ env.BIN_NAME }}
+            ${{ env.BIN_PATH }}
