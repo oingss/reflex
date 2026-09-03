@@ -116,6 +116,6 @@ jobs:
         with:
           tag_name: code
           name: "reflex code"
-          prerelease: false
+          prerelease: true
           files: |
             dist/${{ steps.zip.outputs.zip_name }}
