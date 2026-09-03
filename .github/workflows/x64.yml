@@ -1,4 +1,4 @@
-name: linux 64 ci
+name: linux x64 ci
 
 on:
   workflow_dispatch:
