@@ -561,18 +561,13 @@ pub fn parse_server_handshake(buf: &[u8], user_key: &[u8; 16]) -> anyhow::Result
         )
         .map_err(|_| anyhow::anyhow!("vmess handshake: decrypt header failed"))?;
 
-    // FNV1a 校验（覆盖除末尾 checksum 外的全部明文）
-    anyhow::ensure!(plain.len() >= 4, "vmess handshake: header too short");
-    use fnv::FnvHasher;
-    use std::hash::Hasher;
-    let mut h = FnvHasher::default();
-    h.write(&plain[..plain.len() - 4]);
-    anyhow::ensure!(
-        (h.finish() as u32).to_be_bytes() == plain[plain.len() - 4..],
-        "vmess handshake: FNV1a checksum mismatch"
-    );
-
-    // 解析明文布局
+    // 解析明文布局（先定位地址区结束位置，再校验 FNV1a——覆盖范围必须是
+    // "[0, addr_end)"，checksum 紧跟其后 4 字节，不能依赖 plain.len() 反推，
+    // 否则当 AEAD payload 长度与 "版本+地址+padding+FNV" 所需最小长度不完全
+    // 相等时（部分客户端实现存在这种情况），校验范围会算错，导致 FNV
+    // mismatch——即使密钥、AEAD 解密都是正确的。此处对齐 flux
+    // parse_plain_header：从头部累加地址长度和 padding 得到 addr_end，
+    // 而不是用 plain.len() 反向推导。）
     anyhow::ensure!(plain.len() >= 38 + 2, "vmess handshake: header body truncated");
     anyhow::ensure!(plain[0] == VERSION, "vmess: unsupported header version {}", plain[0]);
     let req_nonce: [u8; 16] = plain[1..17].try_into()?;
@@ -586,13 +581,6 @@ pub fn parse_server_handshake(buf: &[u8], user_key: &[u8; 16]) -> anyhow::Result
     anyhow::ensure!(
         command == CMD_TCP || command == CMD_UDP,
         "vmess: unsupported command 0x{command:02x}"
-    );
-
-    // 地址区结束位置 = 末尾 checksum 前 - padding
-    let addr_end = plain.len() - 4 - padding_len;
-    anyhow::ensure!(
-        addr_end >= 41,
-        "vmess handshake: address area truncated"
     );
     anyhow::ensure!(
         option & (OPT_GLOBAL_PADDING | OPT_AUTHENTICATED_LENGTH) == 0,
@@ -608,34 +596,52 @@ pub fn parse_server_handshake(buf: &[u8], user_key: &[u8; 16]) -> anyhow::Result
 
     let port = u16::from_be_bytes([plain[38], plain[39]]);
     let atyp = plain[40];
+    let mut idx = 41usize;
     let target = match atyp {
         ATYP_IPV4 => {
-            anyhow::ensure!(addr_end >= 44, "vmess: ipv4 addr truncated");
+            anyhow::ensure!(plain.len() >= idx + 4, "vmess: ipv4 addr truncated");
             let ip = IpAddr::V4(std::net::Ipv4Addr::new(
-                plain[41],
-                plain[42],
-                plain[43],
-                plain[44],
+                plain[idx],
+                plain[idx + 1],
+                plain[idx + 2],
+                plain[idx + 3],
             ));
+            idx += 4;
             Target::Socket(SocketAddr::new(ip, port))
         }
         ATYP_DOMAIN => {
-            anyhow::ensure!(addr_end >= 42, "vmess: domain len truncated");
-            let dlen = plain[41] as usize;
-            anyhow::ensure!(
-                addr_end >= 42 + dlen,
-                "vmess: domain truncated"
-            );
-            let domain = String::from_utf8(plain[42..42 + dlen].to_vec())?;
+            anyhow::ensure!(plain.len() > idx, "vmess: domain len truncated");
+            let dlen = plain[idx] as usize;
+            idx += 1;
+            anyhow::ensure!(plain.len() >= idx + dlen, "vmess: domain truncated");
+            let domain = String::from_utf8(plain[idx..idx + dlen].to_vec())?;
+            idx += dlen;
             Target::Domain(domain, port)
         }
         ATYP_IPV6 => {
-            anyhow::ensure!(addr_end >= 56, "vmess: ipv6 addr truncated");
-            let ip: [u8; 16] = plain[41..57].try_into()?;
+            anyhow::ensure!(plain.len() >= idx + 16, "vmess: ipv6 addr truncated");
+            let ip: [u8; 16] = plain[idx..idx + 16].try_into()?;
+            idx += 16;
             Target::Socket(SocketAddr::new(IpAddr::V6(ip.into()), port))
         }
         other => anyhow::bail!("vmess: unknown atyp 0x{other:02x}"),
     };
+
+    // addr_end：地址区（含 padding）结束位置，紧跟其后 4 字节是 FNV1a checksum
+    let addr_end = idx + padding_len;
+    anyhow::ensure!(
+        plain.len() >= addr_end + 4,
+        "vmess handshake: header truncated (missing fnv checksum)"
+    );
+
+    use fnv::FnvHasher;
+    use std::hash::Hasher;
+    let mut h = FnvHasher::default();
+    h.write(&plain[..addr_end]);
+    anyhow::ensure!(
+        (h.finish() as u32).to_be_bytes() == plain[addr_end..addr_end + 4],
+        "vmess handshake: FNV1a checksum mismatch"
+    );
 
     Ok(ServerHandshake {
         req_key,
@@ -1418,5 +1424,34 @@ mod tests {
         let hs = build_handshake(&key, &req_hdr, &Target::Domain("a.b".into(), 1));
         let wrong = [0x99u8; 16];
         assert!(parse_server_handshake(&hs, &wrong).is_err());
+    }
+
+    /// 回归测试：FNV1a 校验范围必须按"地址长度+padding 累加"定位（对齐 flux
+    /// parse_plain_header），而不是用 `plain.len()` 反推。构造一个 header
+    /// 明文里 padding 字段声明的 padding_len 与地址后实际紧跟的 FNV 位置
+    /// 一致、但整体 AEAD payload 长度经过精确计算的场景，确保新逻辑与
+    /// "从头累加"算法结果一致，不受 plain.len() 是否恰好等于最小所需长度
+    /// 影响。（此前的实现用 `plain.len() - 4 - padding_len` 反推地址区
+    /// 终点，一旦 AEAD 解密出的明文长度与协议字段所需最小长度不完全相等
+    /// ——例如 header_len 声明值与实际编码内容之间存在正当的实现差异——
+    /// 就会把 FNV 校验范围算错，导致误判为 checksum mismatch。）
+    #[test]
+    fn handshake_fnv_range_matches_forward_accumulation() {
+        let uuid_bytes = parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let key = user_key(&uuid_bytes);
+        let req_hdr = RequestHeader::new(SECURITY_AES128_GCM, CMD_TCP);
+        // 域名地址 + 服务端要求 target 能正确解出即代表 addr_end 定位正确
+        let target = Target::Domain("very-long-example-domain-name.test".into(), 8443);
+        let hs = build_handshake(&key, &req_hdr, &target);
+
+        let parsed = parse_server_handshake(&hs, &key).unwrap();
+        match parsed.target {
+            Target::Domain(ref h, p) => {
+                assert_eq!(h, "very-long-example-domain-name.test");
+                assert_eq!(p, 8443);
+            }
+            _ => panic!("expected domain target"),
+        }
+        assert_eq!(parsed.consumed, hs.len());
     }
 }
