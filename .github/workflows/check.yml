@@ -114,8 +114,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ci
-          name: "reflex ci"
+          tag_name: code
+          name: "reflex code"
           prerelease: false
           files: |
             dist/${{ steps.zip.outputs.zip_name }}
