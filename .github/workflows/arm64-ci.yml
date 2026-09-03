@@ -1,17 +1,11 @@
-name:  arm64 ci
+name:  linux arm64 ci
 
 on:
-  #push:
-   # paths:
-    #  - 'src/**'
-     # - 'tests/**'
-      #- '.github/workflows/**'
-      #- 'Cargo.toml'
-      #- 'Cargo.lock'
   workflow_dispatch:
 env:
   CARGO_TERM_COLOR: always
   FEATURES: outbound-net
+  BIN_NAME: reflex-aarch64-unknown-linux-musl
 
 jobs:
   test-and-build:
@@ -52,7 +46,8 @@ jobs:
             --release \
             --locked \
             --target aarch64-unknown-linux-musl \
-            --bin reflex
+            --bin reflex \
+            --features "$FEATURES"
 
       # ── 收集产物 ────────────────────────────────────────────────────
       - name: Collect binary
