@@ -46,8 +46,7 @@ jobs:
             --release \
             --locked \
             --target aarch64-unknown-linux-musl \
-            --bin reflex \
-            --features "$FEATURES"
+            --bin reflex
 
       # ── 收集产物 ────────────────────────────────────────────────────
       - name: Collect binary
