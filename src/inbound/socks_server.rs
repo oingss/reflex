@@ -153,10 +153,16 @@ async fn handle(
     let _rsv = stream.read_u8().await?; // reserved, must be 0x00
     let atyp = stream.read_u8().await?;
 
+    if !matches!(atyp, ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6) {
+        send_reply(&mut stream, REP_ATYP_NOT_SUPPORTED).await?;
+        anyhow::bail!("unsupported address type: 0x{atyp:02x}");
+    }
+
     let (target_host, target) = match read_target(&mut stream, atyp).await {
         Ok(v) => v,
         Err(e) => {
-            let _ = send_reply(&mut stream, REP_ATYP_NOT_SUPPORTED).await;
+            // 地址数据残缺/截断等：按 flux 语义回 General Failure
+            let _ = send_reply(&mut stream, REP_GENERAL_FAILURE).await;
             anyhow::bail!("read SOCKS5 target failed: {e}");
         }
     };
