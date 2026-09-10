@@ -857,6 +857,10 @@ impl ClashApi {
                 IB::Tuic(c) => &c.listen,
                 IB::Shadowquic(c) => &c.listen,
                 IB::Wireguard(c) => &c.listen,
+                // http-server / socks-server 是面向远程客户端的服务端入站，
+                // 不占用 Clash 本地代理端口字段，仅报告 bind 地址
+                IB::HttpServer(c) => &c.listen,
+                IB::SocksServer(c) => &c.listen,
             };
             // 绑定 0.0.0.0 或 :: 意味着允许局域网
             if listen == "0.0.0.0" || listen == "::" || listen == "0" {

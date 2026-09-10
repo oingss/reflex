@@ -71,9 +71,10 @@ impl HttpServerInbound {
                 }
             };
 
-            // 提前 try_clone 原始 TCP：TLS 路径下 SniffedStream 需要 raw_tcp
-            // 保留 Drop-RST 语义；明文路径下也可直接复用。
-            let raw = stream.try_clone().ok();
+            // 复制原始 TCP 句柄（tokio 1.x 无 try_clone）：TLS 路径下
+            // SniffedStream 需要 raw_tcp 保留 Drop-RST 语义；明文路径下
+            // 也直接复用该句柄，统一走 from_encrypted。
+            let raw = crate::inbound::proxy_common::duplicate_tcp_stream(&stream).ok();
             let tcp_tx = self.tcp_tx.clone();
             let tag = tag.clone();
             let config = config.clone();
