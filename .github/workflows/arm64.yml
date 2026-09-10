@@ -59,6 +59,8 @@ jobs:
           echo "BIN_PATH=dist/${BIN_NAME}-${SUFFIX}" >> "$GITHUB_ENV"
 
       # ── 发布 Release ────────────────────────────────────────────────
+      # 注意：files 必须是文件 glob（dist/*），不能写目录 dist/，
+      # 否则 action-gh-release 匹配不到文件，release 不会有任何产物
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -66,4 +68,4 @@ jobs:
           name: "reflex ci"
           prerelease: false
           files: |
-            ${{ env.BIN_PATH }}
+            dist/*
