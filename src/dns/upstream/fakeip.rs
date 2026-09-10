@@ -288,9 +288,21 @@ impl FakeIpStore {
         tracing::info!(cleared, "fakeip store reset (memory + persistent)");
     }
 
-    /// 对外暴露 reply 结果，用 Result 区分「正常应答」和「不支持的查询类型」。
-    /// 参照 sing-box fakeip.Transport.Exchange()：非 A/AAAA 直接返回 Err，
-    /// 上层 DnsUpstream::query() 负责将 Err 向外传播（而非吞掉）。
+    /// 对外暴露 reply 结果。
+    ///
+    /// 仅 A(1) / AAAA(28) 分配假 IP；**其他所有 qtype 一律返回空 NOERROR，
+    /// 不再返回错误（对齐 mihomo `dns/middleware.go withFakeIP` 的行为）**：
+    ///
+    /// - mihomo 对 HTTPS/SVCB（qtype 65）显式返回空 NOERROR（
+    ///   `case D.TypeSVCB, D.TypeHTTPS: return handleMsgWithEmptyAnswer(r), nil`），
+    ///   其他非 IP 类型透传给真实解析器，fakeip 中间件永远不会产生错误；
+    /// - 反之，若返回 Err，上层 DnsResolver::run() 会转成 SERVFAIL 回给客户端。
+    ///   Google Play（Cronet/Chromium 网络栈）会并行发送 HTTPS(type 65) 查询，
+    ///   持续收到 SERVFAIL 会触发应用层无限重试（表现为下载转圈），并累积
+    ///   Android netd 的 DNS 服务器失败计数，导致后续解析整体劣化。
+    ///
+    /// 因此这里统一降级为空 NOERROR：客户端视为“无该类型记录”，正常降级到
+    /// A/AAAA 连接。
     pub fn reply(&self, query: &[u8]) -> anyhow::Result<Bytes> {
         use crate::dns::{extract_qname, extract_qtype};
 
@@ -298,10 +310,16 @@ impl FakeIpStore {
             Some(t) => t,
             None => return Ok(make_noerror_empty(query)),
         };
-        // 参照 sing-box：仅支持 A(1) / AAAA(28)，其他类型直接报错，
-        // 让 DNS 路由层感知失败（而非静默返回空成功）。
+        // 非 A/AAAA（含 HTTPS/SVCB qtype 65）：返回空 NOERROR 而非错误。
+        // 对齐 mihomo withFakeIP：HTTPS/SVCB 显式空应答，其余类型不进 fakeip；
+        // 统一降级为空 NOERROR 可避免 SERVFAIL 累积 Android netd 的 DNS
+        // 服务器失败计数（Google Play 下载转圈的根因，见类型注释）。
         if qtype != 1 && qtype != 28 {
-            anyhow::bail!("fakeip: only A/AAAA queries are supported, got qtype={qtype}");
+            tracing::debug!(
+                qtype,
+                "fakeip: non-A/AAAA query, returning empty NOERROR (mihomo-aligned)"
+            );
+            return Ok(make_noerror_empty(query));
         }
 
         let qname = match extract_qname(query) {
@@ -765,17 +783,31 @@ mod tests {
         assert_eq!(store.lookup(ip).as_deref(), Some("lookup.example.com"));
     }
 
-    /// 参照 sing-box：非 A/AAAA 查询由 fakeip transport 返回 error，而非静默 NOERROR-empty。
+    /// 非 A/AAAA 查询返回空 NOERROR（对齐 mihomo withFakeIP 对 HTTPS/SVCB 的处理）。
+    /// 回归背景：旧实现返回 Err → 上层转 SERVFAIL，Google Play 并行的
+    /// HTTPS(type 65) 查询持续失败导致下载转圈。
     #[test]
-    fn fakeip_non_ip_query_returns_error() {
+    fn fakeip_non_ip_query_returns_empty_noerror() {
         let store = new_store_v4();
-        let result = store.reply(&make_fakeip_query("txt.example.com", 16));
-        assert!(result.is_err(), "expected Err for non-A/AAAA qtype, got Ok");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("only A/AAAA"),
-            "unexpected error message: {msg}"
+        // HTTPS (65)
+        let resp = store
+            .reply(&make_fakeip_query("https.example.com", 65))
+            .expect("HTTPS query should not error");
+        assert_eq!(resp[3] & 0x0F, 0, "rcode should be NOERROR");
+        assert_eq!(
+            u16::from_be_bytes([resp[6], resp[7]]),
+            0,
+            "ANCOUNT should be 0 (empty answer)"
         );
+        // TXT (16)
+        let resp = store
+            .reply(&make_fakeip_query("txt.example.com", 16))
+            .expect("TXT query should not error");
+        assert_eq!(resp[3] & 0x0F, 0);
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+        // 且不应为 fakeip 段内地址分配/消耗任何 IP
+        let (alloc, _, _) = store.diag_sizes();
+        assert_eq!(alloc, 0, "non-A/AAAA query must not allocate fakeip");
     }
 
     #[test]
