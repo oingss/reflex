@@ -1,0 +1,66 @@
+name: unused deps
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unused-deps:
+    name: Check unused dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-unused-deps-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-unused-deps-cargo-
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      # cargo-machete 基于静态文本扫描（不编译），速度快但有误报。
+      # --with-metadata 会先跑 `cargo metadata` 过滤掉 build-dep / dev-dep，
+      # 结果更准确；如果某个 crate 确实误报，在 Cargo.toml 里加：
+      #   [package.metadata.cargo-machete]
+      #   ignored = ["some-crate"]
+      - name: Run cargo-machete
+        id: machete
+        run: |
+          cargo machete --with-metadata 2>&1 | tee machete_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # 把结果写进 Job Summary，方便直接在 Actions 页面查看，不用翻日志
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## Unused dependencies report" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat machete_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # 有未使用依赖时让 workflow 失败（CI 拦截），仅手动触发时跳过此步可按需调整
+      - name: Fail if unused deps found
+        if: steps.machete.outputs.exit_code != '0'
+        run: |
+          echo "❌ cargo-machete found unused dependencies (see summary above)"
+          exit 1

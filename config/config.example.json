@@ -1,0 +1,156 @@
+// ============================================================================
+// reflex 配置骨架（config.example.json）
+//
+// 完整的分节配置模板见 config/examples/ 目录，每个文件对应顶层一个字段：
+//   dns.json           → "dns"             DNS 上游与分流规则
+//   inbounds.json      → "inbounds"        入站（含 vless/vmess/trojan/ss 传输层与 REALITY 示例）
+//   outbounds.json     → "outbounds"       出站（全部协议 + selector/url-test 分组）
+//   route.json         → "route"           路由规则、规则集、出口绑定
+//   experimental.json  → "experimental"    cache_file / clash_api
+//   log.json           → "log"             日志
+//
+// 注意：reflex 运行时只读取单个 JSON 文件（支持 // 注释），
+// examples/ 下的文件是按节拆分的模板，供按需拷贝组合到主配置中。
+// ============================================================================
+
+{
+  // DNS：默认直连上游 + 国内域名走本地
+  "dns": {
+    "servers": [
+      { "tag": "local", "address": "223.5.5.5", "detour": "direct", "timeout": 5 },
+      { "tag": "remote", "address": "https://1.1.1.1/dns-query", "detour": "🚀 节点选择", "timeout": 5 },
+      {
+        "tag": "fakeip",
+        "address": "fakeip://",
+        "fakeip": { "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18" }
+      }
+    ],
+    "rules": [
+      { "ruleset": ["geosite-cn"], "action": "route", "server": "local" },
+      { "query_type": ["A", "AAAA"], "action": "route", "server": "fakeip" }
+    ],
+    "final": "remote",
+    "strategy": "ipv4_only",
+    "proxy_domain_resolver": "local",
+    "disable_cache": false
+  },
+
+  // 入站：mixed 代理 + FakeIP DNS；更多入站（tun/tproxy/socks/http/http-server/socks-server/协议入站）见 examples/inbounds.json
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    },
+    {
+      "type": "dns",
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "listen_port": 5353
+    }
+  ],
+
+  // 路由：嗅探 → 国内直连 → 其余走代理分组；完整规则见 examples/route.json
+  "route": {
+    "auto_detect_interface": true,
+    "ipv6": true,
+    "rules": [
+      {
+        "action": "sniff",
+        "sniff_type": ["tls", "http", "quic", "ssh", "bittorrent"],
+        "timeout_ms": 300,
+        "override_destination": false
+      },
+      { "action": "hijack-dns", "protocol": ["dns"] },
+      { "ruleset": ["geosite-ads"], "action": "block" },
+      { "ruleset": ["geosite-cn"], "outbound": "direct" },
+      { "action": "resolve", "server": "remote" },
+      { "ruleset": ["geoip-cn"], "outbound": "direct" }
+    ],
+    "final": "🚀 节点选择",
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "local",
+        "path": "/etc/reflex/rules/geosite-cn.rrs"
+      },
+      {
+        "tag": "geosite-ads",
+        "type": "local",
+        "format": "source",
+        "path": "/etc/reflex/rules/geosite-ads.json"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.srs",
+        "path": "/var/cache/reflex/geoip-cn.rrs",
+        "download_detour": "direct",
+        "update_interval": "24h"
+      }
+    ]
+  },
+
+  // 出站：完整协议示例（vless/vmess/trojan/ss/tuic/hy2/naive/anytls/shadowquic/ssh/tailscale/wireguard 等）见 examples/outbounds.json
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "🚀 节点选择",
+      "outbounds": ["自动选择", "direct"],
+      "default": "自动选择"
+    },
+    {
+      "type": "url-test",
+      "tag": "自动选择",
+      "outbounds": ["proxy"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m"
+    },
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "your.domain.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "ws",
+        "path": "/your-path",
+        "headers": { "Host": "your.domain.com" }
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "your.domain.com",
+        "insecure": false,
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      }
+    },
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
+  ],
+
+  // 实验性功能：Clash API / 缓存文件；完整字段见 examples/experimental.json
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true
+    },
+    "clash_api": {
+      "enabled": true,
+      "default_mode": "rule",
+      "mode_list": ["rule", "global", "direct"],
+      "external_controller": "127.0.0.1:9090",
+      "secret": "",
+      "external_ui": "ui"
+    }
+  },
+
+  // 日志；完整字段见 examples/log.json
+  "log": {
+    "level": "info",
+    "output": "stderr",
+    "timestamp": true
+  }
+}
