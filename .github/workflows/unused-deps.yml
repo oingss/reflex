@@ -33,34 +33,38 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-unused-deps-cargo-
 
-      - name: Install cargo-machete
+      - name: Install cargo-shear
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-machete
+          tool: cargo-shear
 
-      # cargo-machete 基于静态文本扫描（不编译），速度快但有误报。
-      # --with-metadata 会先跑 `cargo metadata` 过滤掉 build-dep / dev-dep，
-      # 结果更准确；如果某个 crate 确实误报，在 Cargo.toml 里加：
-      #   [package.metadata.cargo-machete]
+      # cargo-shear 让 rustc 真正编译一遍，在宏展开后的代码上分析实际被
+      # 链接使用的依赖，比 cargo-machete 的纯文本扫描准确得多
+      # （derive / proc-macro 间接使用不会被误报），且运行在 stable 上。
+      #
+      # 如确有依赖被误报（例如仅通过 feature 间接引用），在 Cargo.toml 加：
+      #   [package.metadata.cargo-shear]
       #   ignored = ["some-crate"]
-      - name: Run cargo-machete
-        id: machete
+      #
+      # 本地可直接运行：cargo shear（或 cargo shear --fix 自动删除无用依赖）
+      - name: Run cargo-shear
+        id: shear
         run: |
-          cargo machete --with-metadata 2>&1 | tee machete_output.txt
+          cargo shear 2>&1 | tee shear_output.txt
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       # 把结果写进 Job Summary，方便直接在 Actions 页面查看，不用翻日志
       - name: Write summary
         if: always()
         run: |
-          echo "## Unused dependencies report" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Unused dependencies report (cargo-shear)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat machete_output.txt >> "$GITHUB_STEP_SUMMARY"
+          cat shear_output.txt >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # 有未使用依赖时让 workflow 失败（CI 拦截），仅手动触发时跳过此步可按需调整
+      # 有未使用依赖时让 workflow 失败（CI 拦截）
       - name: Fail if unused deps found
-        if: steps.machete.outputs.exit_code != '0'
+        if: steps.shear.outputs.exit_code != '0'
         run: |
-          echo "❌ cargo-machete found unused dependencies (see summary above)"
+          echo "❌ cargo-shear found unused dependencies (see summary above)"
           exit 1
