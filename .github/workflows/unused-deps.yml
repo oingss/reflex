@@ -68,3 +68,60 @@ jobs:
         run: |
           echo "❌ cargo-shear found unused dependencies (see summary above)"
           exit 1
+  unused-deps1:
+    name: Check unused dependencies
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-unused-deps-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-unused-deps-cargo-
+
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear
+
+      # cargo-shear 让 rustc 真正编译一遍，在宏展开后的代码上分析实际被
+      # 链接使用的依赖，比 cargo-machete 的纯文本扫描准确得多
+      # （derive / proc-macro 间接使用不会被误报），且运行在 stable 上。
+      #
+      # 如确有依赖被误报（例如仅通过 feature 间接引用），在 Cargo.toml 加：
+      #   [package.metadata.cargo-shear]
+      #   ignored = ["some-crate"]
+      #
+      # 本地可直接运行：cargo shear（或 cargo shear --fix 自动删除无用依赖）
+      - name: Run cargo-shear
+        id: shear
+        run: |
+          cargo shear 2>&1 | tee shear_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # 把结果写进 Job Summary，方便直接在 Actions 页面查看，不用翻日志
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## Unused dependencies report (cargo-shear)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat shear_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # 有未使用依赖时让 workflow 失败（CI 拦截）
+      - name: Fail if unused deps found
+        if: steps.shear.outputs.exit_code != '0'
+        run: |
+          echo "❌ cargo-shear found unused dependencies (see summary above)"
+          exit 1
+
