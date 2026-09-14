@@ -1,0 +1,465 @@
+// ============================================================================
+// 出站配置模板（对应顶层 "outbounds" 字段）
+//
+// 拷贝到主配置时，把 "outbounds" 数组的内容填入顶层 "outbounds" 键即可。
+// 覆盖全部协议：selector/url-test 分组 + vless/vmess/trojan/shadowsocks/tuic/
+// hysteria2/anytls/naive/shadowquic/ssh/tailscale/wireguard/socks/http/direct/block。
+// ============================================================================
+
+{
+  "outbounds": [
+    // ══ 分组节点 ═════════════════════════════════════════════════════════════
+    {
+      "type": "selector",
+      "tag": "🚀 节点选择",
+      "outbounds": ["自动选择", "proxy", "vmess-ws-tls", "vmess-tcp", "vmess-grpc", "vless-grpc", "trojan-grpc", "ss-grpc", "tuic-proxy", "hy2-proxy", "naive-proxy", "shadowquic-proxy", "ssh-proxy", "tailscale-proxy", "direct"],
+      "default": "自动选择"
+    },
+    {
+      "type": "url-test",
+      "tag": "自动选择",
+      "outbounds": ["proxy", "vmess-ws-tls", "vmess-tcp", "vmess-grpc", "vless-grpc", "trojan-grpc", "ss-grpc", "tuic-proxy", "hy2-proxy", "naive-proxy", "shadowquic-proxy"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "idle_timeout": "30m",
+      "tolerance": 50
+    },
+
+    // ══ VLESS ═══════════════════════════════════════════════════════════════
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "your.domain.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "transport": {
+        "type": "ws",
+        "path": "/your-path",
+        "headers": { "Host": "your.domain.com" }
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "your.domain.com",
+        "insecure": false,
+        "alpn": ["h2", "http/1.1"],
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      }
+    },
+    {
+      // VLESS + REALITY（服务端 private_key 对应此处的 public_key）
+      "type": "vless",
+      "tag": "proxy-reality",
+      "server": "your.server.ip",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "reality": {
+          "enabled": true,
+          "public_key": "服务端x25519公钥(base64url)",
+          "short_id": "abcdef01"
+        }
+      }
+    },
+    {
+      // VLESS + XHTTP + TLS
+      "type": "vless",
+      "tag": "vless-xhttp-tls",
+      "server": "your.server.ip",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "insecure": false
+      },
+      "transport": {
+        "type": "xhttp",
+        "path": "/xhttp",
+        "mode": "packet-up"
+      }
+    },
+    {
+      // VLESS + gRPC + TLS
+      // gRPC 传输基于 HTTP/2，必须启用 TLS 且 alpn 必须包含 h2。
+      // service_name 会拼接成 `/{service_name}/Tun` 路径，需与服务端一致。
+      "type": "vless",
+      "tag": "vless-grpc",
+      "server": "your-grpc-server.example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "your-grpc-server.example.com",
+        "insecure": false,
+        "alpn": ["h2"],
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService",
+        "host": "your-grpc-server.example.com"
+      }
+    },
+
+    // ══ VMess ═══════════════════════════════════════════════════════════════
+    {
+      "type": "vmess",
+      "tag": "vmess-ws-tls",
+      "server": "your-vmess-server.example.com",
+      "server_port": 443,
+      "uuid": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+      "security": "auto",
+      "transport": {
+        "type": "ws",
+        "path": "/vmess",
+        "headers": { "Host": "your-vmess-server.example.com" }
+      },
+      "tls": { "enabled": true, "server_name": "your-vmess-server.example.com", "insecure": false }
+    },
+    {
+      "type": "vmess",
+      "tag": "vmess-tcp",
+      "server": "your-vmess-tcp-server.example.com",
+      "server_port": 80,
+      "uuid": "cccccccc-dddd-eeee-ffff-000000000000",
+      "security": "auto",
+      "transport": { "type": "tcp" },
+      "tls": { "enabled": false }
+    },
+    {
+      // VMess + gRPC + TLS
+      // 与 VLESS + gRPC 一致：基于 HTTP/2，TLS alpn 必须包含 h2。
+      "type": "vmess",
+      "tag": "vmess-grpc",
+      "server": "your-vmess-grpc-server.example.com",
+      "server_port": 443,
+      "uuid": "dddddddd-eeee-ffff-0000-111111111111",
+      "security": "auto",
+      "tls": {
+        "enabled": true,
+        "server_name": "your-vmess-grpc-server.example.com",
+        "insecure": false,
+        "alpn": ["h2"],
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService",
+        "host": "your-vmess-grpc-server.example.com"
+      }
+    },
+
+    // ══ Trojan ══════════════════════════════════════════════════════════════
+    {
+      "type": "trojan",
+      "tag": "trojan-proxy",
+      "server": "your.domain.com",
+      "server_port": 443,
+      "password": "your-password",
+      "tls": { "enabled": true, "server_name": "your.domain.com", "insecure": false }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws",
+      "server": "your.domain.com",
+      "server_port": 443,
+      "password": "your-password",
+      "transport": { "type": "ws", "path": "/trojan", "headers": { "Host": "your.domain.com" } },
+      "tls": { "enabled": true, "server_name": "your.domain.com", "insecure": false }
+    },
+    {
+      // Trojan + gRPC + TLS
+      // gRPC 传输将 Trojan 握手与数据流承载于 HTTP/2 帧，需配合 TLS（alpn 含 h2）。
+      "type": "trojan",
+      "tag": "trojan-grpc",
+      "server": "your-trojan-grpc-server.example.com",
+      "server_port": 443,
+      "password": "your-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "your-trojan-grpc-server.example.com",
+        "insecure": false,
+        "alpn": ["h2"],
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService",
+        "host": "your-trojan-grpc-server.example.com"
+      }
+    },
+
+    // ══ Shadowsocks ═════════════════════════════════════════════════════════
+    {
+      "type": "shadowsocks",
+      "tag": "ss-proxy",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "your-password",
+      "multiplex": { "enabled": false, "protocol": "smux", "max_connections": 4, "min_streams": 4, "max_streams": 0, "padding": false }
+    },
+    {
+      // Shadowsocks + gRPC + TLS
+      // gRPC 传输将 SS 字节流承载于 HTTP/2 POST 帧，需配合 TLS（alpn 含 h2）。
+      "type": "shadowsocks",
+      "tag": "ss-grpc",
+      "server": "your-ss-grpc-server.example.com",
+      "server_port": 443,
+      "method": "aes-256-gcm",
+      "password": "your-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "your-ss-grpc-server.example.com",
+        "insecure": false,
+        "alpn": ["h2"],
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "GunService",
+        "host": "your-ss-grpc-server.example.com"
+      }
+    },
+
+    // ══ TUIC / Hysteria2 / AnyTLS（QUIC/TLS 流式）════════════════════════════
+    {
+      "type": "tuic",
+      "tag": "tuic-proxy",
+      "server": "your.domain.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "password": "your-password",
+      "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
+      "tls": { "server_name": "your.domain.com", "alpn": ["h3"], "insecure": false }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-proxy",
+      "server": "your-hy2-server.example.com",
+      "server_port": 443,
+      "password": "your-password",
+      "tls": { "enabled": true, "server_name": "your-hy2-server.example.com", "insecure": false },
+      "up_mbps": 50,
+      "down_mbps": 200
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-proxy",
+      "server": "your-anytls-server.example.com",
+      "server_port": 443,
+      "password": "your-password",
+      "tls": { "enabled": true, "server_name": "your-anytls-server.example.com", "insecure": false },
+      "idle_session_check_interval": "30s",
+      "idle_session_timeout": "60s",
+      "min_idle_session": 0
+    },
+
+    // ══ NaiveProxy（HTTP/2 CONNECT 隧道）══════════════════════════════════════
+    {
+      // NaiveProxy 出站：基于 HTTP/2 CONNECT 隧道，承载于 TLS 之上。
+      // 协议参考：https://github.com/klzgrad/naiveproxy
+      // 字段与 sing-box option.NaiveOutboundOptions 完全对齐。
+      //
+      // 注意：sing-box 原生通过 cronet-go（Chrome 网络栈）实现，支持 HTTP/3 (QUIC)。
+      // 本实现使用 h2 crate，仅支持 HTTP/2 over TCP+TLS（启用 quic 会报错）。
+      // 字段 quic / quic_congestion_control / quic_session_receive_window 仅保留
+      // 以兼容 sing-box 配置语法，写入会被忽略或导致错误。
+      "type": "naive",
+      "tag": "naive-proxy",
+      "server": "your-naive-server.example.com",
+      "server_port": 443,
+      "username": "user",
+      "password": "your-password",
+      // 可选：不安全并发数（对应 sing-box InsecureConcurrency）。
+      // 大于 1 时 sing-box 会启用多个独立连接池轮询使用；本实现记录但不强制隔离。
+      "insecure_concurrency": 0,
+      // 可选：额外 HTTP 请求头（对应 sing-box ExtraHeaders）。
+      // sing-box 原始类型为 map[string][]string，此处取每个键的首个值。
+      // "extra_headers": { "X-Custom-Header": "value" },
+      // 可选：HTTP/2 流接收窗口大小（对应 sing-box stream_receive_window）。
+      // 接受纯数字或带 K/M/G 后缀的字符串（如 "64K"、"1M"），0 = 使用 h2 默认值。
+      "stream_receive_window": 0,
+      // 可选：UDP over TCP（对应 sing-box udp_over_tcp）。
+      // 简写：true / false（version 默认 2，与 sing-box 一致）
+      // 完整：{ "enabled": true, "version": 2 }
+      // 启用后 UDP 流量通过 TCP 隧道传输，否则 UDP 流量会被拒绝。
+      "udp_over_tcp": true,
+      // 可选：QUIC/HTTP3 模式（对应 sing-box QUIC）。本实现暂不支持，启用会报错。
+      "quic": false,
+      // 可选：QUIC 拥塞控制算法（对应 sing-box QUICCongestionControl）。
+      // 可选值：""（默认）、"bbr"、"bbr2"、"cubic"、"reno"。仅在 QUIC 模式下生效。
+      "quic_congestion_control": "",
+      // 可选：QUIC 会话接收窗口大小（对应 sing-box quic_session_receive_window）。仅在 QUIC 模式下生效。
+      "quic_session_receive_window": 0,
+      // TLS 配置（NaiveProxy 必须启用 TLS，对应 sing-box OutboundTLSOptionsContainer.TLS）。
+      "tls": {
+        "enabled": true,
+        "server_name": "your-naive-server.example.com",
+        "insecure": false
+        // 可选：自定义 CA 证书（PEM 内容数组，对应 sing-box TLS.Certificate）
+        // "certificate": ["-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"],
+        // 可选：自定义 CA 证书文件路径（对应 sing-box TLS.CertificatePath）
+        // "certificate_path": "/etc/reflex/certs/naive.pem"
+      }
+    },
+
+    // ══ ShadowQuic（0-RTT QUIC + JLS SNI 伪装）═══════════════════════════════
+    {
+      // ShadowQuic 出站：0-RTT QUIC + JLS SNI 伪装，主动探测防御。
+      // 协议参考：https://github.com/salsa-energy/shadowquic
+      // 与 flux 服务端 `type = "shadowquic"` 节点对接。
+      //
+      // 关键概念：
+      //   server_name — JLS SNI 伪装域名，必须与服务端 jls_upstream 的域名一致
+      //                 （例如服务端 jls_upstream = "www.bing.com:443"，则此处填 "www.bing.com"）。
+      //   username/password — JLS 认证凭据，必须与服务端 users 中的某一项完全一致。
+      //   alpn — 默认 ["h3"]，必须与服务端有交集。
+      //
+      // 字段与 shadowquic crate `ShadowQuicClientCfg` 对齐：
+      "type": "shadowquic",
+      "tag": "shadowquic-proxy",
+      "server": "your-shadowquic-server.example.com",
+      "server_port": 443,
+      "username": "alice",
+      "password": "your-password",
+      "server_name": "www.bing.com"
+      // 可选高级参数（以下均为默认值）：
+      // "alpn": ["h3"],
+      // "initial_mtu": 1300,            // 初始 MTU，高丢包网络建议 1400
+      // "min_mtu": 1290,                // 最小 MTU（必须小于 initial_mtu）
+      // "congestion_control": "bbr",    // 也支持 "cubic" | "new-reno" | "brutal"
+      // "brutal_bandwidth": 10000000,   // 仅 congestion_control="brutal" 时生效，单位 bps，默认 10 Mbps
+      // "zero_rtt": true,               // 启用 0-RTT 握手
+      // "over_stream": false,           // UDP over stream 模式（false=datagram 更高效）
+      // "keep_alive_interval": 0,       // Keep alive 间隔（毫秒），0=禁用，应 < 30000
+      // "gso": true,                    // 启用 QUIC GSO
+      // "mtu_discovery": true,          // 启用 MTU 自动发现
+      // "blackhole_detection": false    // 启用 MTU 黑洞检测，高丢包网络建议关闭
+    },
+
+    // ══ SSH（russh 隧道，不支持 UDP 转发）═════════════════════════════════════
+    {
+      // ── SSH 出站 ──────────────────────────────────────────────────────
+      // 通过 SSH 隧道转发 TCP 流量（russh 实现），适用于受限网络环境下的回连。
+      // 协议参考：clash-rs SSH outbound（https://github.com/Watfaq/clash-rs）
+      //
+      // 认证方式（按顺序尝试）：
+      //   1. publickey — 加载 private_key 指向的 PEM 文件（支持 ~ 展开）
+      //   2. password  — 密码登录
+      //   3. keyboard-interactive — 配合 TOTP 2FA 使用
+      //
+      // 注意：
+      // - SSH 出站**不支持 UDP 转发**（与 clash-rs 行为一致）
+      // - host_key 留空时跳过服务端公钥校验（不安全，仅调试用）
+      // - TOTP 用于键盘交互认证中的 "Verification code:" 提示
+      "type": "ssh",
+      "tag": "ssh-proxy",
+      "server": "your-ssh-server.example.com",
+      "server_port": 22,
+      "username": "root"
+      // "password": "your-password",            // 可选：配合键盘交互或单独使用
+      // "private_key": "~/.ssh/id_ed25519",     // 可选：私钥文件路径或内联 PEM 内容
+      // "private_key_passphrase": "",           // 可选：加密私钥的保护密码
+      // "host_key": [                           // 可选：期望的服务端公钥（OpenSSH 格式）
+      //   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+      // ],
+      // "host_key_algorithms": [                // 可选：限制 host key 算法
+      //   "ssh-ed25519",
+      //   "rsa-sha2-256"
+      // ],
+      // "totp_opt": {                            // 可选：TOTP 2FA 配置
+      //   // 写法一：otpauth URL
+      //   "type": "otp-auth",
+      //   "secret": "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&period=30"
+      //   // 写法二：显式字段
+      //   // "type": "common",
+      //   // "secret": "JBSWY3DPEHPK3PXP",
+      //   // "step": 30,
+      //   // "digits": 6,
+      //   // "algorithm": "sha1"
+      // }
+    },
+
+    // ══ Tailscale（userspace netstack）═══════════════════════════════════════
+    {
+      // ── Tailscale 出站 ──────────────────────────────────────────────────
+      // 通过 Tailscale userspace netstack 转发流量到 tailnet 内的节点或
+      // 经由 subnet router 可达的内部服务。
+      // 协议参考：clash-rs Tailscale outbound（tailscale-rs crate）
+      //
+      // 注意：
+      // - **不暴露 exit-node 选择**（与 clash-rs 一致）：用户应通过 Tailscale
+      //   控制台配置 subnet router，并把目标 IP 设为该 subnet 内的地址。
+      // - 首次使用需提供 auth_key 完成加入 tailnet；之后状态会写入 state_dir。
+      // - ephemeral=true 时每次启动都是新身份，忽略 state_dir。
+      // - state_dir 留空时使用内存状态，进程退出即丢失身份。
+      // - 自托管 Headscale 时把 control_url 改为 Headscale 地址。
+      "type": "tailscale",
+      "tag": "tailscale-proxy",
+      "auth_key": "tskey-auth-XXXXXXXXXXXXXXXXXXXX",
+      "hostname": "reflex-node",
+      "state_dir": "/var/lib/reflex/tailscale"
+      // "control_url": "https://controlplane.tailscale.com",  // 自托管 Headscale 时覆盖
+      // "client_name": "reflex",          // 控制台展示用，默认 "reflex"
+      // "ephemeral": false                // true 时退出 tailnet 后自动清理
+    },
+
+    // ══ WireGuard（隧道）═════════════════════════════════════════════════════
+    {
+      "type": "wire-guard",
+      "tag": "wg-out",
+      "address": ["10.0.0.2/32", "fd00::2/128"],
+      "private_key": "YOUR_PRIVATE_KEY_BASE64",
+      "peers": [
+        {
+          "address": "wg.example.com",
+          "port": 51820,
+          "public_key": "PEER_PUBLIC_KEY_BASE64",
+          "pre_shared_key": "",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "reserved": []
+        }
+      ],
+      "mtu": 1408
+    },
+
+    // ══ SOCKS / HTTP 代理 ═══════════════════════════════════════════════════
+    {
+      "type": "socks",
+      "tag": "socks-proxy",
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "version": "5",
+      "username": "user",
+      "password": "pass"
+    },
+
+    // ══ 内置动作 ═════════════════════════════════════════════════════════════
+    {
+      "type": "direct",
+      "tag": "direct"
+      // network_strategy: "happy_eyeballs" 启用 RFC 8305 风格的多候选地址
+      //   并发拨号：域名同时有 A/AAAA 记录时，错峰尝试多个候选，谁先连上用谁，
+      //   可缓解双栈网络下因某个协议栈故障/丢包造成的连接延迟。
+      //   对齐 sing-box network_strategy。
+      // fallback_delay_ms: 启动下一个候选前的等待毫秒数，默认 250（RFC 8305 推荐值）。
+      // "network_strategy": "happy_eyeballs",
+      // "fallback_delay_ms": 250
+    },
+    {
+      "type": "block",
+      "tag": "block"
+      // method: "drop" 时静默丢弃——不关闭连接也不回任何数据，连接会一直挂着
+      //   直到客户端自己放弃。比默认立即关闭更难被探测区分"被拒绝"和
+      //   "网络不通"。对齐 sing-box reject 动作的 method 字段
+      //   （不填或 "default" 为立即关闭，即原有行为）。
+      // "method": "drop"
+    }
+  ]
+}

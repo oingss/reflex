@@ -1,0 +1,121 @@
+name: checks
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FEATURES: outbound-net
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-checks-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checks-cargo-
+
+      - name: Run cargo check
+        run: cargo check --locked --all-targets
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-checks-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checks-cargo-
+
+      - name: Run tests
+        run: cargo test --locked
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-checks-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checks-cargo-
+
+      - name: Run clippy
+        run: cargo clippy --locked -- -D warnings
+
+  package:
+    name: package source
+    needs: [check, test, clippy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip source
+        id: zip
+        run: |
+          mkdir -p dist
+          if [ ! -f update.log ]; then
+            echo "update.log not found in repo root" >&2
+            exit 1
+          fi
+          NAME="$(head -n 1 update.log | tr -d '\r\n')"
+          if [ -z "$NAME" ]; then
+            echo "update.log first line is empty" >&2
+            exit 1
+          fi
+          echo "zip_name=$NAME" >> "$GITHUB_OUTPUT"
+          git archive --format=zip --output="dist/$NAME.zip" HEAD
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: code
+          name: "reflex code"
+          prerelease: true
+          files: |
+            dist/*
