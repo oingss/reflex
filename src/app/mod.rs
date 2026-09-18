@@ -46,7 +46,7 @@ use outbound_mgr::{OutboundManager, OutboundManagerConfig};
 use ruleset_registry::RuleSetRegistry;
 use stats::Stats;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::inbound::{redir::RedirInbound, tproxy::TProxyInbound};
 
 pub struct App {
@@ -501,7 +501,7 @@ impl App {
         for ib_config in inbounds_iter {
             match ib_config {
                 InboundConfig::TProxy(c) => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     {
                         info!(tag=%c.tag, listen=%c.listen, port=%c.listen_port, "starting tproxy inbound");
                         let mut c = c.clone();
@@ -511,21 +511,21 @@ impl App {
                         let inbound = TProxyInbound::new(c, tcp_tx.clone(), udp_tx.clone());
                         tasks.spawn(async move { inbound.run().await });
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     {
-                        anyhow::bail!("tproxy inbound '{}' is only supported on Linux", c.tag);
+                        anyhow::bail!("tproxy inbound '{}' is only supported on Linux/Android", c.tag);
                     }
                 }
                 InboundConfig::Redir(c) => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     {
                         info!(tag=%c.tag, listen=%c.listen, port=%c.listen_port, "starting redir inbound");
                         let inbound = RedirInbound::new(c.clone(), tcp_tx.clone());
                         tasks.spawn(async move { inbound.run().await });
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     {
-                        anyhow::bail!("redir inbound '{}' is only supported on Linux", c.tag);
+                        anyhow::bail!("redir inbound '{}' is only supported on Linux/Android", c.tag);
                     }
                 }
                 InboundConfig::Mixed(c) => {
