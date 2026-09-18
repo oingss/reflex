@@ -5,13 +5,13 @@ pub mod http;
 pub mod http_server;
 pub mod mixed;
 pub mod naive;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod redir;
 pub mod shadowquic;
 pub mod shadowsocks;
 pub mod socks;
 pub mod socks_server;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod tproxy;
 pub mod trojan;
 pub mod tuic;
