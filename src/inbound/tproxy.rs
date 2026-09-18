@@ -20,6 +20,25 @@ use crate::{
     inbound::{display_sockaddr, InboundTcpStream, InboundUdpPacket, SniffedStream, Target, UdpSession},
 };
 
+/// socket2 0.5 在 android target 上未导出 `set_ip_transparent`，
+/// 直接用 libc::setsockopt 设置 IP_TRANSPARENT，兼容 linux 和 android。
+fn set_ip_transparent(sock: &Socket) -> std::io::Result<()> {
+    unsafe {
+        let one: libc::c_int = 1;
+        let ret = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TRANSPARENT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub struct TProxyInbound {
     config: TProxyInboundConfig,
     tcp_tx: mpsc::Sender<InboundTcpStream>,
@@ -86,7 +105,7 @@ fn create_tproxy_tcp_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     // - IPv4 socket：IP_TRANSPARENT(SOL_IP)
     // - IPv6 socket：IP_TRANSPARENT(SOL_IP) + IPV6_TRANSPARENT(SOL_IPV6)
     //   sing-box 对 IPv6 监听同时设置两者，这里对齐。
-    sock.set_ip_transparent(true)?;
+    set_ip_transparent(&sock)?;
     if is_v6 {
         // 显式 IPV6_V6ONLY=false：确保 "::" 监听能同时接收 IPv4-mapped 流量。
         // Rust socket2 不像 Go stdlib 会对 AF_INET6 socket 隐式置 V6ONLY=0，
@@ -258,7 +277,7 @@ fn create_tproxy_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSoc
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     // 对齐 sing-box redir.TProxy：IPv4 设 IP_TRANSPARENT，IPv6 额外设 IPV6_TRANSPARENT
-    sock.set_ip_transparent(true)?;
+    set_ip_transparent(&sock)?;
     if is_v6 {
         // 显式 IPV6_V6ONLY=false：确保 "::" 双栈监听能收到 IPv4-mapped 流量。
         // 下方 IP_RECVORIGDSTADDR 双栈处理逻辑依赖 V6ONLY=false（否则永远收不到
@@ -731,7 +750,7 @@ fn create_tproxy_writeback_socket(
             }
         }
     } else {
-        sock.set_ip_transparent(true)?;
+        set_ip_transparent(&sock)?;
     }
     // nonblocking：send_to 在 send buffer 满时返回 EAGAIN，由调用方丢弃包。
     // 阻塞模式会在高流量时卡住整个 writeback 任务（它跑在 tokio async block 里
