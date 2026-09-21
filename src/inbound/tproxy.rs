@@ -8,11 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{
-    io::unix::AsyncFd,
-    net::{TcpListener, TcpStream},
-    sync::mpsc,
-};
+use tokio::{io::unix::AsyncFd, net::TcpListener, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::{
