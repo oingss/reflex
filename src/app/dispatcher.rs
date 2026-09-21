@@ -113,9 +113,14 @@ fn host_and_dest_ip(sniffed: Option<&str>, target: &Target) -> (String, String) 
 ///   对 Domain 变体是 1 次 String clone（比 to_string 省去 ':' 和 port 的格式化）。
 // 会话按 (src, outbound) 聚合：同一客户端 socket 访问多个目标时复用一条出站连接，
 // 对齐 mihomo `natTable` 按 `packet.LocalAddr()`（即客户端源地址）聚合的语义。
-// FakeIP 场景因回包源地址伪装需要 per-target 的 origin_destination，不走聚合
-// （见 run_udp 里的 fakeip 分流）。
-type UdpSessionKey = (SocketAddr, Arc<str>); // (src, outbound_tag)
+// FakeIP 场景额外把 origin_destination（原 fakeip SocketAddr）纳入 key：
+// - 同一 (src, outbound) 访问不同 fakeip 时各自独立会话，保证回包源地址
+//   伪装（spoofed_src）在会话内恒定、永不串扰；
+// - 同一 (src, fakeip) 复用同一条出站 UDP 会话（session_id 不变），服务端
+//   看到稳定的对端 4 元组——这是 QUIC 握手的前提。此前 FakeIP 走"每包独立
+//   出站"，QUIC 的每个握手包都在服务端开新 socket，被对端按路径验证丢弃，
+//   导致 Google Play 等基于 QUIC 的下载永远无法完成。
+type UdpSessionKey = (SocketAddr, Arc<str>, Option<SocketAddr>); // (src, outbound_tag, fakeip origin)
 
 /// 向已存在会话的入站方向投递数据
 struct UdpSessionHandle {
@@ -728,26 +733,13 @@ impl Dispatcher {
                         }
                     };
 
-                    // FakeIP 场景不走 session 聚合：回包源地址需要伪装回原 fakeip
-                    // （packet.origin_destination），不同目标的 fakeip 不同，聚合会导致
-                    // 回包源地址伪装错误，客户端 NAT 不匹配而丢包。走 dispatch_udp
-                    // 保持每包独立出站，与原行为一致。
-                    if packet.origin_destination.is_some() {
-                        let mgr = self.outbound_mgr.clone();
-                        let dns_tx = self.dns_tx.clone();
-                        let stats = self.stats.clone();
-                        let conn_tracker = self.conn_tracker.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = dispatch_udp(packet, action, rule_info, mgr, dns_tx, stats, conn_tracker).await {
-                                debug!(err=%e, "udp (fakeip) dispatch error");
-                            }
-                        });
-                        continue;
-                    }
-
                     // 会话去重 key：按 (src, outbound) 聚合，同一客户端 socket 访问
                     // 多个目标时复用一条出站连接（对齐 mihomo natTable 按 src 聚合）。
-                    let session_key: UdpSessionKey = (packet.src, outbound_tag.clone());
+                    // FakeIP 场景额外纳入 origin_destination（原 fakeip），见
+                    // UdpSessionKey 上的注释：不同 fakeip 各自成会话（回包伪装
+                    // 恒定），同一 fakeip 复用会话（服务端 4 元组稳定，QUIC 可握手）。
+                    let session_key: UdpSessionKey =
+                        (packet.src, outbound_tag.clone(), packet.origin_destination);
 
                     // 实际拨号目标：应用 override_address/override_port。
                     let mut dial_target = packet.target.clone();
@@ -801,12 +793,16 @@ impl Dispatcher {
                         let rule_info_clone = rule_info.clone();
                         // Arc<str> clone 只是原子 +1
                         let ob_tag_str = outbound_tag.clone();
+                        // FakeIP 原始地址（回包伪装源），非 FakeIP 恒为 None。
+                        // 会话 key 已包含它，会话内恒定。
+                        let origin = packet.origin_destination;
 
                         tokio::spawn(async move {
                             run_udp_session(
                                 src,
                                 inbound_tag,
                                 ob_tag_str,
+                                origin,
                                 data_rx,
                                 reply_tx,
                                 rule_info_clone,
@@ -843,6 +839,7 @@ async fn run_udp_session(
     src: SocketAddr,
     inbound_tag: String,
     outbound_tag: Arc<str>,
+    origin: Option<SocketAddr>,
     mut data_rx: mpsc::Receiver<(Target, bytes::Bytes)>,
     reply_tx: mpsc::Sender<(bytes::Bytes, SocketAddr, SocketAddr)>,
     rule_info: RuleInfo,
@@ -931,8 +928,10 @@ async fn run_udp_session(
         },
         sniffed_protocol: None,
         sniffed_domain: None,
-        // FakeIP 场景已在前置分流走 dispatch_udp，此处恒为 None。
-        origin_destination: None,
+        // FakeIP 原始地址（会话 key 的一部分，会话内恒定）：出站回包时把源
+        // 地址伪装回该 fakeip（对齐 sing-box bufio.NewNATPacketConn）。
+        // 非 FakeIP 会话为 None，出站回退用首包目标作为回包源地址。
+        origin_destination: origin,
         upstream_rx: Some(data_rx),
         lifetime_guards: vec![Box::new(conn_guard), Box::new(_guard)],
     };

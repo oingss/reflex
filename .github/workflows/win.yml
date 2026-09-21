@@ -70,6 +70,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name:   bin
-          name:       "reflex ci"
+          name:       "reflex bin"
           files:      |
             ${{ env.BIN_PATH }}
