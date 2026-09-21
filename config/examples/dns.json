@@ -1,0 +1,146 @@
+// ============================================================================
+// DNS 配置模板（对应顶层 "dns" 字段）
+//
+// 拷贝到主配置时，把下面整个对象填入顶层 "dns" 键即可（去掉本注释块）。
+// ============================================================================
+
+{
+  "dns": {
+    "servers": [
+      // ── UDP DNS（最基础，默认端口 53）────────────────────────────────────
+      // 两种写法等价：裸 IP / 显式 udp:// 前缀
+      {
+        "tag": "local",
+        "address": "223.5.5.5",       // 阿里 DNS；也可用 "119.29.29.29"（腾讯）
+        "detour": "direct",
+        "timeout": 5
+      },
+      {
+        "tag": "local-udp",
+        "address": "udp://223.5.5.5:53", // 显式 udp:// 前缀写法
+        "detour": "direct",
+        "timeout": 5
+      },
+
+      // ── TCP DNS ──────────────────────────────────────────────────────────
+      {
+        "tag": "local-tcp",
+        "address": "tcp://223.5.5.5",
+        "detour": "direct",
+        "timeout": 5
+      },
+
+      // ── DNS-over-HTTPS（DoH）────────────────────────────────────────────
+      {
+        "tag": "remote",
+        "address": "https://1.1.1.1/dns-query",
+        "detour": "🚀 节点选择",
+        "timeout": 5
+      },
+      {
+        "tag": "remote-doh-domain",
+        "address": "https://dns.google/dns-query",
+        "domain_resolver": "local",  // address 为域名时用哪个 server 解析它
+        "detour": "🚀 节点选择",
+        "timeout": 5
+        // "client_subnet": "1.2.3.0/24", // EDNS Client Subnet（可选）
+        // "insecure": false             // 跳过 TLS 证书验证（仅调试用）
+      },
+
+      // ── DNS-over-TLS（DoT）──────────────────────────────────────────────
+      {
+        "tag": "remote-dot",
+        "address": "tls://1.1.1.1:853",
+        "sni": "cloudflare-dns.com", // address 为 IP 时建议显式填 SNI
+        "detour": "🚀 节点选择",
+        "timeout": 5
+      },
+
+      // ── DNS-over-QUIC（DoQ）─────────────────────────────────────────────
+      {
+        "tag": "remote-doq",
+        "address": "quic://dns.adguard.com",
+        "sni": "dns.adguard.com",
+        "timeout": 5
+      },
+
+      // ── DNS-over-HTTP/3（DoH3，QUIC + HTTP/3）──────────────────────────
+      // 相比 DoH 在弱网下握手更省 RTT；需启用 outbound-net feature 编译
+      {
+        "tag": "remote-doh3",
+        "address": "h3://1.1.1.1/dns-query",
+        "detour": "🚀 节点选择",
+        "timeout": 5
+      },
+
+      // ── 本地 hosts 文件 DNS（对齐 sing-box hosts.Transport）────────────
+      // 直接读 /etc/hosts，不发起任何网络查询；用于内网域名或屏蔽
+      {
+        "tag": "hosts",
+        "address": "hosts://"         // 也可 "hosts:///etc/hosts" 指定路径
+      },
+
+      // ── 本地系统 DNS（对齐 sing-box local.Transport）────────────────────
+      // 读 /etc/resolv.conf + /etc/hosts，按系统 resolver 行为查询
+      {
+        "tag": "local-system",
+        "address": "local://",
+        "timeout": 5
+      },
+
+      // ── 内置响应码（拦截用）─────────────────────────────────────────────
+      // 三种内置动作：
+      //   refused   → 返回 REFUSED（客户端应退避）
+      //   success   → 返回空 NOERROR（用于"已屏蔽但勿报错"的伪装成功）
+      //   nxdomain  → 返回 NXDOMAIN（域名不存在）
+      {
+        "tag": "block-dns",
+        "address": "rcode://refused"
+      },
+      {
+        "tag": "block-dns-success",
+        "address": "rcode://success"
+      },
+      {
+        "tag": "block-dns-nxdomain",
+        "address": "rcode://nxdomain"
+      },
+
+      // ── FakeIP ───────────────────────────────────────────────────────────
+      // 排除某些域名不走 FakeIP 的做法与 sing-box 一致：在 dns.rules 中把排除规则
+      // 放在 fakeip 规则之前，让该域名走真实上游即可。例如：
+      //   { "domain_suffix": ["lan", "local", "internal", "corp"], "action": "route", "server": "local" }
+      //   { "query_type": ["A", "AAAA"], "action": "route", "server": "fakeip" }
+      {
+        "tag": "fakeip",
+        "address": "fakeip://",
+        "fakeip": {
+          "inet4_range": "198.18.0.0/15",
+          "inet6_range": "fc00::/18"
+        }
+      }
+    ],
+    "rules": [
+      // 动作唯一决定语义：route（默认，server 必填）/ block（直接返回 rcode）
+      // - block 无需单独声明 rcode:// server，method 缺省 refused
+      { "ruleset": ["geosite-ads"], "action": "block", "method": "nxdomain" },
+      { "ruleset": ["geosite-cn"], "action": "route", "server": "local" },
+      { "query_type": ["A", "AAAA"], "action": "route", "server": "fakeip" }
+    ],
+    "final": "remote",
+    "strategy": "ipv4_only",
+    // 代理出站节点的 server 字段是域名时，用哪个 DNS server tag 解析它。
+    // 等价于 sing-box route.default_domain_resolver（DomainResolveOptions）。
+    // 支持两种写法：
+    //   1) 简写（只给 server tag）："proxy_domain_resolver": "local"
+    //      strategy 沿用上面的全局 "strategy"，启用缓存。
+    //   2) 完整对象："proxy_domain_resolver": { "server": "local", "strategy": "prefer_ipv4", "disable_cache": false }
+    //      strategy 不填则沿用全局；disable_cache 默认 false。
+    "proxy_domain_resolver": "local",
+    "disable_cache": false,
+    "disable_hosts": false,           // true 时跳过系统 hosts 文件查询
+    "cache_capacity": 4096,
+    "cache_ttl_max": 3600,
+    "optimistic_timeout": 180
+  }
+}
