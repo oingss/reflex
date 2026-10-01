@@ -1,0 +1,15 @@
+[package]
+name = "reflex-bpf"
+version = "0.1.0"
+edition = "2021"
+
+# eBPF 数据面：单独用 nightly + bpf-linker 以 bpfel/bpfeb-unknown-none 目标编译
+# （见 .github/workflows/ebpf.yml），不参与默认构建（default-members 已排除）。
+
+[[bin]]
+name = "reflex"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+reflex-ebpf-common = { path = "../reflex-ebpf-common" }

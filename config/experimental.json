@@ -1,0 +1,39 @@
+// ============================================================================
+// 实验性功能模板（对应顶层 "experimental" 字段）
+//
+// 拷贝到主配置时，把下面整个对象填入顶层 "experimental" 键即可。
+// ============================================================================
+
+{
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true
+    },
+    "clash_api": {
+      // 总开关：启用 Clash API（/version /proxies /traffic 等接口）。
+      // - true：监听 external_controller，提供 API
+      // - false：clash_api 完全不启动
+      "enabled": true,
+      "default_mode": "rule",
+      "mode_list": ["rule", "global", "direct"],
+      "external_controller": "0.0.0.0:9090",
+      "secret": "",
+      // Web UI 静态文件目录；为空则不提供 UI 文件服务。
+      // 与 sing-box `external_ui` 字段对齐。
+      // 启动时若该目录不存在或为空，会自动从 external_ui_download_url 下载并解压。
+      "external_ui": "ui",
+      // Web UI 自动下载 URL（zip 格式）。不填时默认使用 metacubexd 最新 release。
+      // 与 sing-box `external_ui_download_url` 字段对齐。
+      // "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/releases/latest/download/compressed-dist.tgz",
+      // 下载 UI 时使用的出站 tag（选填）。
+      // "external_ui_download_detour": "direct",
+      // 访问 http://<external_controller>/  会 302 重定向到 /ui/，自动打开面板。
+      // 若设了 secret，可在 URL 里带 ?secret=xxx 免填：
+      //   http://127.0.0.1:9090/ui/?secret=your-secret
+      "access_control_allow_origin": [],
+      "access_control_allow_private_network": false
+    }
+  }
+}

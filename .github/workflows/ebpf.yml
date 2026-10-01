@@ -1,0 +1,160 @@
+name: ebpf ci
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# commit-bpf 需要向仓库推送 bpf/*.o。
+permissions:
+  contents: write
+
+# 避免多次手动触发并发推送同一分支。
+concurrency:
+  group: ebpf-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. 编译 eBPF 数据面（reflex-bpf）────────────────────────────────────
+  # 产物 reflex.bpf.{el,eb}.o 供用户态构建时内嵌（build.rs 从 bpf/ 目录
+  # 读取并通过 include_bytes! 编译进二进制，运行时按目标端序自动选择）；
+  # 也可通过 ebpf.bpf_object 显式指定外部路径覆盖。
+  # 发布工作流把 el 版本放到 reflex 源码树 bpf/reflex.bpf.el.o 后再构建
+  # 用户态二进制，即可获得免分发 .o 的单文件产物。
+  build-bpf:
+    name: Build BPF / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bpfel-unknown-none
+            artifact: reflex.bpf.el.o
+          - target: bpfeb-unknown-none
+            artifact: reflex.bpf.eb.o
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # bpf* targets 是 Tier 3：rustup 从不分发 rust-std，安装 target 必然失败
+      # （rustup 回溯 15 天后报 "component unavailable"）。core 由下方
+      # -Z build-std=core 从 rust-src 源码现场编译，无需预装 target。
+      - name: Install Rust nightly (rust-src for build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # bpf-linker 从源码 cargo install 依赖特定 LLVM 版本系统库，官方推荐
+      # CI 直接用预编译 musl 二进制
+      - name: Install bpf-linker (prebuilt)
+        run: |
+          curl -fL \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+            -o /tmp/bpf-linker.tar.zst
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          mkdir -p "$HOME/.local/bin"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bpf-linker --version
+
+      # 必须生成 BTF：lan 模式的 bpf_loop 回调（route_loop_cb）是独立 BPF 子函数，
+      # 内核要求带 BTF func_info，否则校验器报 "missing btf func_info"（EINVAL）。
+      # 工作区根 Cargo.toml 的 [profile.release] 是 debug=false + strip=symbols，
+      # 这里用环境变量仅对本次 bpf 构建覆盖：debug=2 让 rustc 产出完整调试信息，
+      # bpf-linker 的 --btf 据此生成 .BTF/.BTF.ext；strip 必须关掉。
+      - name: Build reflex-bpf
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "2"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+          RUSTFLAGS: "-C link-arg=--btf"
+        run: |
+          cargo +nightly build \
+            --manifest-path reflex-bpf/Cargo.toml \
+            --release \
+            --target ${{ matrix.target }} \
+            -Z build-std=core
+
+      - name: Rename artifact
+        run: cp target/${{ matrix.target }}/release/reflex ${{ matrix.artifact }}
+
+      # 防回归：bpf helper 必须是 `call <helper id>`，不能被编成指向未定义符号的
+      # pseudo-call（extern "C" 声明 helper 会如此），否则 aya 加载时报
+      # "function 0x.. not found while relocating ..."。
+      - name: Verify no unresolved helper relocations
+        run: |
+          if ! readelf -S -W ${{ matrix.artifact }} | grep -qE '\.BTF\.ext'; then
+            echo "::error::missing .BTF/.BTF.ext in ${{ matrix.artifact }} (kernel will reject bpf_loop callback)"
+            exit 1
+          fi
+          if readelf -r -W ${{ matrix.artifact }} | grep -E 'R_BPF_64_32.*[[:space:]]bpf_'; then
+            echo "::error::found unresolved bpf_* call relocations (helpers must be called via helper ID)"
+            exit 1
+          fi
+
+      - name: Upload BPF object
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ── 1b. 把编译好的 .o 提交回仓库 bpf/ 目录 ──────────────────────────────
+  # build.rs 从 bpf/ 读取 .o 内嵌进二进制，因此提交后后续构建直接可用。
+  # 仅当产物内容有变化时才提交；提交到触发本工作流的分支。
+  commit-bpf:
+    name: Commit BPF objects to bpf/
+    needs: build-bpf
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download BPF objects
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reflex.bpf.*.o
+          path: bpf
+          merge-multiple: true
+
+      - name: Commit and push
+        run: |
+          ls -l bpf/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bpf/reflex.bpf.el.o bpf/reflex.bpf.eb.o
+          if git diff --cached --quiet; then
+            echo "bpf objects unchanged, nothing to commit"
+            exit 0
+          fi
+          git commit -m "ci: update prebuilt eBPF objects (bpf/*.o) [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  # ── 2. 用户态 ebpf feature 编译检查（加载器/编译器/解释器）───────────────
+  check-userspace:
+    name: cargo check/test (ebpf feature)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-ebpf-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ebpf-cargo-
+
+      - name: clippy (ebpf feature, -D warnings)
+        run: cargo clippy --locked --features ebpf --all-targets -- -D warnings
+
+      - name: Run ebpf unit tests (compiler + interpreter)
+        run: cargo test --locked --features ebpf ebpf

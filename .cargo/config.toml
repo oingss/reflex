@@ -1,0 +1,12 @@
+# cargo 配置。
+#
+# 说明：针对 musl 静态目标（aarch64-unknown-linux-musl / x86_64-unknown-linux-musl），
+# `cross` 容器内的 self-contained linker 包装脚本（用于按 rustc 版本选择正确的 crt
+# 对象与链接器标志）会以 `set -x` 方式向 stderr 输出自身调用过程。Rust 1.78+ 的
+# `linker_messages` lint 会把任何链接器 stderr 当作告警上抛，造成每次 release 构建都
+# 打印一条无意义的 "linker stderr: + set -euo pipefail ..." 告警。
+#
+# 该告警不影响产物正确性（真正的链接错误仍以非零退出码上报），仅针对 musl 目标
+# 静音此 lint。
+[target.'cfg(target_env = "musl")']
+rustflags = ["-A", "linker_messages"]

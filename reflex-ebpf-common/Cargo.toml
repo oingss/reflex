@@ -1,0 +1,12 @@
+[package]
+name = "reflex-ebpf-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# aya-pod feature：为共享 POD 类型实现 aya::Pod（仅用户态加载器需要；
+# reflex-bpf 以 bpf 目标编译本 crate 时不启用，aya 不参与 BPF 构建）。
+aya = { version = "0.13", optional = true }
+
+[features]
+aya-pod = ["dep:aya"]
