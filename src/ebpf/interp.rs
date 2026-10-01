@@ -272,7 +272,10 @@ mod tests {
     #[test]
     fn empty_plane_still_has_private_direct() {
         let compiled = compile_kernel_plane(&[], &[], &[]).unwrap();
-        assert_eq!(compiled.match_sets.len(), 3); // [IP_SET private][GROUP_END][TERMINATE]
+        // [IP_SET private][IP_SET local][GROUP_END][TERMINATE]
+        // private 与 local 独立 set_id、组内 OR（local 集合另供内核 DNS
+        // 劫持跳过"发往本机地址:53"，见 CONFIG_KEY_LOCAL_SET_ID）。
+        assert_eq!(compiled.match_sets.len(), 4);
         assert_eq!(compiled.direct_rulesets, 0);
         assert_eq!(compiled.block_rulesets, 0);
     }

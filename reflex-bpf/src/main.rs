@@ -93,8 +93,7 @@ static META: Array<u32> = Array::with_max_entries(2, 0);
 /// 所有 IP_SET 查询恒 miss（geoip/私网/本机直连全失效，内核面退化成
 /// 全量 PROXY）。
 #[map]
-static LPM: LpmTrie<[u8; common::LPM_KEY_LEN], u32> =
-    LpmTrie::with_max_entries(MAX_LPM_ENTRIES, 0);
+static LPM: LpmTrie<[u8; LPM_KEY_LEN], u32> = LpmTrie::with_max_entries(MAX_LPM_ENTRIES, 0);
 
 /// 运行时配置：`CONFIG[CONFIG_KEY_MARK]`=tproxy fwmark，
 /// `CONFIG[CONFIG_KEY_DNS_HIJACK]`=全局 DNS 劫持开关。
@@ -914,7 +913,7 @@ fn lpm_hit(set_id: u16, addr: &[u8; 16]) -> bool {
     //（大端 set_id），见 LPM map 文档。
     let key = Key::new(
         16 + 128,
-        common::lpm_key(set_id, *addr),
+        lpm_key(set_id, *addr),
     );
     LPM.get(&key).is_some()
 }
