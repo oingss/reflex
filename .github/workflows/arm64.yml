@@ -45,6 +45,7 @@ jobs:
           cross build \
             --release \
             --locked \
+            --no-default-features \
             --target aarch64-unknown-linux-musl \
             --features ebpf \
             --bin reflex
